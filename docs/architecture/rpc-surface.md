@@ -69,11 +69,16 @@ Broker-to-recipient delivery is a JSON-RPC **request whose response is the ackno
 | --- | --- | --- |
 | `admin/subscribe` | `{principal, channel}` | Force a subscription ([ADR-0009](../decision-records/0009-self-service-subscriptions-human-override.md)); `system` record attributed to the admin principal |
 | `admin/unsubscribe` | `{principal, channel}` | Cancel a subscription; same recording |
-| `channel/rename` | `{channel, new_name}` | Display-name change; internal id immutable, history untouched |
-| `message/status` | `{message_id}` | Per-recipient acknowledgment states with retained failure reasons |
+| `channel/rename` | `{channel, new_name}` | Display-name change; internal id immutable, history untouched. Works on archived channels (frees a name — [ADR-0018](../decision-records/0018-channel-lifecycle-archive-and-guarded-deletion.md)) |
+| `channel/archive` | `{channel}` | Hide from directory, refuse new subscriptions, force-cancel active ones (`system` records). Name stays reserved — one namespace across live and archived |
+| `channel/unarchive` | `{channel}` | Restore an archived channel. Unconditional: name reservation makes collision impossible |
+| `channel/delete` | `{channel}` | Phase one of guarded permanent deletion: returns `{confirmation_token}` — single-use, short-lived, bound to this session and channel |
+| `channel/delete_confirm` | `{channel, confirmation_token}` | Phase two: physically removes the channel and its records, writes a tombstone `system` record, frees the name ([ADR-0018](../decision-records/0018-channel-lifecycle-archive-and-guarded-deletion.md)) |
+| `message/status` | `{message_id}` | Per-recipient acknowledgment states with per-state timestamps and retained failure reasons |
 | `daemon/status` | `{}` | Version, uptime, connected sessions (`client_info`, bound principal), channel/principal counts. Also the CLI's lazy-start health check |
 | `daemon/shutdown` | `{}` | Graceful stop |
 
+- Deletion always crosses at least two deliberate steps: the two-phase token handshake at the protocol, plus the interface's own confirmation (the TUI requires typing the channel name verbatim) — see [ADR-0018](../decision-records/0018-channel-lifecycle-archive-and-guarded-deletion.md).
 - An admin session's `history/get` accepts any channel and any DM pair: `{dm_between: [a, b]}`.
 - The manager sends through the same `message/send` — no privileged send path ([ADR-0006](../decision-records/0006-human-as-first-class-principal.md)).
 - Admin verbs on a non-admin session: `NOT_ADMIN`.
@@ -87,7 +92,7 @@ Registration-free observation — a bare connection may `session/hello` and watc
 | `watch/start` | `{channels?: []}` (omitted = everything, DMs included) | ok; broker then streams `watch/event` notifications |
 | `watch/stop` | `{}` | ok |
 
-`watch/event {record}` carries the unified log stream: `message` records, `system` records, and acknowledgment transitions, interleaved chronologically. Watching is read-only and leaves no trace in the log.
+`watch/event` streams log records (`message` | `system`) as they are appended, plus **live acknowledgment transitions** (`kind: "ack"`). Ack transitions are wire-only telemetry: never stored, never in `history/get` — current ack state, with per-state timestamps, is queryable via `message/status` ([message model](message-model.md#acknowledgment-lifecycle)). Watching is read-only and leaves no trace in the log.
 
 ## Errors
 
@@ -103,5 +108,6 @@ Application error codes, stable symbolic names in `error.data.code`:
 | -32005 | `NOT_ADMIN` | Admin verb on a non-admin session |
 | -32006 | `SHUTTING_DOWN` | Broker is stopping; retry against the next daemon |
 | -32007 | `SCOPE_DENIED` | History scope outside the caller's visibility (e.g. another pair's DMs) |
+| -32008 | `BAD_CONFIRMATION` | Deletion token missing, expired, already used, or bound to another session/channel |
 
 Broker-unreachable is not an error code: it is the adapter failing the agent's tool call locally, per the message model.

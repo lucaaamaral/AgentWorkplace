@@ -19,6 +19,12 @@ Every future adapter must ship its own session-lifecycle document answering the 
 
 Presence determines the fate of a delivery but never advances it: a disconnected recipient's deliveries **fail** (no store-and-forward across sessions), a present-but-busy recipient's deliveries are **held** until the harness accepts input. Relay and processing come from delivery attempts and harness protocol signals — see the [acknowledgment lifecycle](../architecture/message-model.md#acknowledgment-lifecycle).
 
+## Broker restart
+
+Sessions outlive the broker. Every bus-facing client (channel shims, adapters, the TUI) reconnects with capped exponential backoff (on the order of 1 s doubling to ~30 s, indefinitely — the session may outlive a long outage), replays `session/hello`, and re-registers the principal binding it carries; the restarted broker holds no active claims, so re-registration cannot be denied. During the outage nothing buffers client-side: agent tool calls fail with an explicit error per the message model, and shims queue nothing.
+
+On the broker side, `held` delivery state survives restart ([ADR-0017](../decision-records/0017-embedded-sqlite-storage.md)) but is re-evaluated, not blindly re-sent: startup opens a re-attach grace window (~60 s) before presence is judged. Held messages whose recipients re-attach within it are delivered; recipients still absent when it closes fail per-recipient (reason: disconnected) — consistent with no store-and-forward across sessions.
+
 ## Adapter obligations
 
 Each adapter's session-lifecycle document must answer, for its harness:

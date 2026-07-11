@@ -55,6 +55,8 @@ Per-recipient delivery state, inspectable by the human. Session presence — how
 - Per-harness asymmetry is accepted and displayed honestly: `relayed` might be a protocol fact or a transport fact; the human interface shows what is known without faking uniformity.
 - `processed` means "the harness ran a turn", never "the agent acted on it" — no state name may suggest comprehension.
 - A "subsequent bus tool call implies processed" heuristic for Claude was considered and **deliberately not adopted**: it would display inference as fact. Revisit only if the human interface proves blind in practice.
+- **Ack state is stored; ack transitions are not.** Per-recipient state carries a timestamp for each state reached, queryable via `message/status`; transitions are streamed live to watchers only and never become log records — the log's record kinds stay `message` | `system`.
+- `held` state survives a broker restart and is re-evaluated after a re-attach grace window — see [broker restart](../adapters/session-lifecycle.md#broker-restart).
 
 ## Send results and errors
 
@@ -79,7 +81,7 @@ Pull-only (settled). Shape:
 
 ## System events
 
-One log. Every record carries a `kind` (`message` | `system`). Registrations, denials, and subscription changes (self-service and human overrides) are `system` records interleaved chronologically with chat — the timeline reads as it happened. System records are observable (TUI, history) but never delivered to agents as messages.
+One log. Every record carries a `kind` (`message` | `system`). Registrations, denials, subscription changes (self-service and human overrides), and channel lifecycle events (create, rename, archive, unarchive, and deletion tombstones — [ADR-0018](../decision-records/0018-channel-lifecycle-archive-and-guarded-deletion.md)) are `system` records interleaved chronologically with chat — the timeline reads as it happened. System records are observable (TUI, history) but never delivered to agents as messages.
 
 ## Identifiers and naming
 
