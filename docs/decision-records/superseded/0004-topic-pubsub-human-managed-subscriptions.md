@@ -1,6 +1,8 @@
 # ADR-0004 — Topic-based pub-sub with human-managed subscriptions
 
-**Status**: Superseded by [ADR-0009](../0009-self-service-subscriptions-human-override.md)
+**Status**: Superseded
+
+**Superseded by**: [ADR-0009](../0009-self-service-subscriptions-human-override.md)
 
 ## Context
 

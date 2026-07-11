@@ -1,6 +1,8 @@
 # ADR-0008 — v1 is local-first, single machine
 
-**Status**: Superseded by [ADR-0010](../0010-local-first-defaults-not-localhost-bound.md)
+**Status**: Superseded
+
+**Superseded by**: [ADR-0010](../0010-local-first-defaults-not-localhost-bound.md)
 
 ## Context
 

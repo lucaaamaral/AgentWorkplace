@@ -1,0 +1,111 @@
+# Message model
+
+**Status: decided**, except the items listed under [Open items](#open-items). Decisions were made against the option analysis in the git history of this document; short rationale is kept inline. JSON in this document is illustrative; the normative encoding will be JSON Schema files once the open items close.
+
+Settled context this document builds on: channel-based pub-sub with intersection addressing ([ADR-0009](../decision-records/0009-self-service-subscriptions-human-override.md)), broker-owned append-only audit log ([ADR-0005](../decision-records/0005-broker-owned-append-only-audit-log.md)), push delivery with adapters relaying into the harness's own message flow ([ADR-0001](../decision-records/0001-push-delivery-not-polling.md), [ADR-0003](../decision-records/0003-per-harness-native-push-adapters.md)), non-retroactive subscriptions, pull-only history, JSON-RPC 2.0 wire protocol ([ADR-0014](../decision-records/0014-json-rpc-wire-protocol.md)).
+
+## Envelope
+
+Field names are explicit by design — no abbreviated keys.
+
+```json
+{
+  "message_id": <message_id>,
+  "thread_id": <thread_id>,
+  "timestamp": <unix_timestamp_utc>,
+  "sender": <principal>,
+  "recipients": { "channels": [<channel>], "principals": [<principal>] },
+  "body": <text>,
+  "truncated": <bool>
+}
+```
+
+- **Broker-assigned fields**: `message_id`, `timestamp`, and `sender` are set by the broker — `sender` from the authenticated session binding, never from sender-supplied input, so authorship cannot be claimed.
+- **Body**: markdown is the default format; free-flow plain text is equally valid (markdown is a superset in practice). No structured/typed bodies for now.
+- **Size limit**: default on multi-megabyte range, configurable. Oversized bodies are **truncated, not rejected**, and the store records `truncated: true` on the message.
+
+## Threads and replies
+
+Threading is by **thread id**, not by per-message reply pointers.
+
+- Every message belongs to a thread. A message sent without a thread reference starts a new thread (`thread_id` broker-assigned); a reply carries the existing `thread_id`.
+- A reply is a normal message: addressing is explicit, not inherited from the thread's earlier messages — intersection semantics stay uniform.
+- Delivery rendering exposes the `thread_id` so the recipient can thread its answer.
+
+## Mentions and direct messages
+
+- A direct message is plain addressing: `principals` set, `channels` empty. No subscription concept applies to DMs; no hidden pairwise channels are materialized. **Any principal can DM any principal** — DM reachability is not policy-controlled. The audit log records DMs like any message, and the human sees them (full visibility).
+- An **@mention in the body is parsed by the broker, and never widens delivery**: recipients are determined solely by addressing and subscriptions (intersection semantics). If the mentionee is among the resolved recipients, the mention is just emphasis. If not, the mentionee is recorded as an **interested party** to that message's channel — a visible marker in the log and human interface, not a delivery.
+
+## Delivery expectations
+
+A delivered message does **not** oblige a reply. Agents answer when an answer is explicitly requested, or when they judge one useful; the conventions snippet installed at setup states this. Message-level "answer requested" signaling is prose, not an envelope field.
+
+## Acknowledgment lifecycle *(provisional until spikes)*
+
+Per-recipient delivery state, inspectable by the human:
+
+| State | Meaning | Source |
+| --- | --- | --- |
+| `held` | In the broker; recipient not currently deliverable (session down, or busy and harness not accepting input) | broker |
+| `relayed` | Handed to the harness's message flow | adapter (Claude: notification emitted; Codex: `turn/start` accepted) |
+| `processed` | The recipient's harness completed a turn that included the message | adapter (Codex: `turn/completed`; Claude side unknown — spike) |
+| `failed` | Relay errored (harness rejected the injection); adapter error retained | adapter |
+
+Per-harness asymmetry is explicitly permitted: if a harness cannot observe processing, its recipients top out at `relayed`. `processed` means "the harness ran a turn", never "the agent acted on it" — no state name may suggest comprehension. Final names and transitions are fixed after the spikes.
+
+## Send results and errors
+
+- **Unknown names are errors**: a send referencing a channel or principal that does not exist fails, and nothing is stored — an unknown name is a typo, not an empty audience.
+- **Empty audiences are reported, not errored**: a send to a channel with no subscribers, or an intersection that resolves to nobody, succeeds with a delivery report stating zero recipients and why (no subscribers vs empty intersection). The message is stored — it happened, even if nobody heard it.
+- **Broker unreachable is an error to the model**: if the daemon is down, the send tool call fails with an explicit error surfaced to the agent; never silent loss.
+
+## Delivery rendering
+
+The adapter emits a **structured, visibly-delimited block** carrying the bus channel, sender, `thread_id`, body, and a reply instruction (included per-message initially; may be dropped once the conventions snippet proves sufficient).
+
+The bus does not control the harness surface and does not pretend to: how that block reaches the model — as an MCP-originated message, a notification event, or otherwise — is determined by each harness's own intake path, and may differ from a user message. The adapter's contract ends at emitting the block through the harness's sanctioned mechanism.
+
+## History
+
+Pull-only (settled). Shape:
+
+- **Scope**: an agent may retrieve history for any channel it *could subscribe to* — not only current subscriptions. Relevant information may live in a channel that is not the agent's to act on; the request itself is visible in the log.
+- **Pagination**: cursor-based (last `message_id`), count-bounded, newest-last. Ids are ordered and the log is append-only, so cursors stay stable.
+- The human interface reads the same store without these limits.
+
+## System events
+
+One log. Every record carries a `kind` (`message` | `system`). Registrations, denials, and subscription changes (self-service and human overrides) are `system` records interleaved chronologically with chat — the timeline reads as it happened. System records are observable (TUI, history) but never delivered to agents as messages.
+
+## Identifiers and naming
+
+- **Message ids**: broker-assigned monotonic integers — unique and order-preserving within one broker. Multi-broker uniqueness (ULIDs etc.) is not a current need.
+- **Channels**: keyed by immutable internal id; display name `#`-prefixed, lowercase alphanumeric plus `-`, broker-enforced. Renames change the display name without rewriting history.
+- **Principals**: same charset discipline, `@`-prefixed in display; uniqueness enforced at registration (active-claim denial, settled).
+
+## Wire protocol
+
+JSON-RPC 2.0 on every broker connection — see [ADR-0014](../decision-records/0014-json-rpc-wire-protocol.md).
+
+## Registration symmetry
+
+If a registration exists, a deregistration must also exist: the tool surface includes an explicit `deregister`, unbinding the session from its principal and recorded as a `system` event. Connection termination remains the implicit unbind (and the unlock mechanism for the principal name); `deregister` makes intent visible in the log.
+
+## Tool contract
+
+Semantics of the agent-facing tool surface, uniform across harnesses. Exact tool names and signatures are implementation concerns; every call transits the broker and is visible in the log.
+
+| Tool | Semantics |
+| --- | --- |
+| register | Bind this session to a principal. Denied if the principal is active; unbind by `deregister` or connection termination. `system` event. |
+| deregister | Unbind this session from its principal, releasing the name. `system` event. |
+| send | Publish with intersection addressing, optionally into an existing thread. Result is the delivery report (recipient count; zero-recipient reason). Errors on unknown names and on broker unreachable. |
+| subscribe / unsubscribe | Self-service channel membership. Fails against human-forced/cancelled state. Result states the effective subscriptions. `system` event. |
+| create channel | Create a new channel (name rules per [Identifiers and naming](#identifiers-and-naming)). Available to agents, but the conventions snippet instructs preferring an existing channel — discover via `who` first. `system` event. |
+| history | Explicit pull, any subscribable channel, cursor-based (see [History](#history)). |
+| who | Directory: all channels, each with its subscribed principals. |
+
+## Open items
+
+1. **Ack lifecycle finalization** — after the harness spikes.
