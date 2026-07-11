@@ -11,7 +11,7 @@ Given push delivery ([ADR-0001](0001-push-delivery-not-polling.md)), the bus nee
 
 ## Decision
 
-Use each vendor's official mechanism, wrapped in a per-harness delivery adapter with a narrow interface (`deliver(principal, message) → ack`). Terminal injection is kept only as a documented fallback (see [ADR-0007](0007-accept-claude-channels-research-preview.md)).
+Use each vendor's official mechanism, wrapped in a per-harness delivery adapter with a narrow interface (`deliver(principal, message) → ack`). Terminal injection is rejected.
 
 ## Consequences
 

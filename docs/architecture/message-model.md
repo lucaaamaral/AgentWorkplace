@@ -1,6 +1,6 @@
 # Message model
 
-**Status: decided**, except the items listed under [Open items](#open-items). Decisions were made against the option analysis in the git history of this document; short rationale is kept inline. JSON in this document is illustrative; the normative encoding will be JSON Schema files once the open items close.
+**Status: decided.** Decisions were made against the option analysis in the git history of this document; short rationale is kept inline. The ack lifecycle is finalized against the harness spikes ([Open items](#open-items)). JSON in this document is illustrative; the normative encoding will be JSON Schema files.
 
 Settled context this document builds on: channel-based pub-sub with intersection addressing ([ADR-0009](../decision-records/0009-self-service-subscriptions-human-override.md)), broker-owned append-only audit log ([ADR-0005](../decision-records/0005-broker-owned-append-only-audit-log.md)), push delivery with adapters relaying into the harness's own message flow ([ADR-0001](../decision-records/0001-push-delivery-not-polling.md), [ADR-0003](../decision-records/0003-per-harness-native-push-adapters.md)), non-retroactive subscriptions, pull-only history, JSON-RPC 2.0 wire protocol ([ADR-0014](../decision-records/0014-json-rpc-wire-protocol.md)).
 
@@ -49,7 +49,7 @@ Per-recipient delivery state, inspectable by the human. Session presence — how
 | --- | --- | --- |
 | `held` | In the broker; recipient not currently delivered | broker |
 | `relayed` | Handed to the harness's message flow | broker delivery attempt |
-| `processed` | The recipient's harness completed a turn that included the message | adapter confirmation |
+| `processed` | The recipient's harness completed a turn that included the message | adapter confirmation; When not available, recipients top out at `relayed` |
 | `failed` | Relay errored; adapter error retained and visible to the human | adapter / broker |
 
 - Per-harness asymmetry is accepted and displayed honestly: `relayed` might be a protocol fact or a transport fact; the human interface shows what is known without faking uniformity.
@@ -108,7 +108,3 @@ Semantics of the agent-facing tool surface, uniform across harnesses. Exact tool
 | create channel | Create a new channel (name rules per [Identifiers and naming](#identifiers-and-naming)). Available to agents, but the conventions snippet instructs preferring an existing channel — discover via `who` first. `system` event. |
 | history | Explicit pull, any subscribable channel, cursor-based (see [History](#history)). |
 | who | Directory: all channels, each with its subscribed principals. |
-
-## Open items
-
-1. **Harness behavior confirmations (spikes).** The state model above is decided; what the spikes may still adjust is mechanics: Claude — whether a pushed event starts a turn on an idle session and how events queue mid-turn; Codex — what `turn/start` does during an active turn (rejected vs queued), which determines how much holding the broker performs versus the protocol. Findings are documented under `docs/adapters/`.

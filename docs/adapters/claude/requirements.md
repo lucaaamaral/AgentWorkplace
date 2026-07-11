@@ -20,7 +20,7 @@ Claude Code TUI ── stdio ── channel shim ── local IPC ── broker
 - CL-1. Translate broker delivery into a `notifications/claude/channel` notification on the session's stdio connection, formatted so the event identifies the bus channel, the sender, the body, and how to reply through the bus tools.
 - CL-2. Report acknowledgment to the broker: at minimum "notification emitted into session"; "turn started" if the protocol surfaces it.
 - CL-3. Events can only reach an open session. When the shim is not connected the recipient is disconnected: the broker marks the delivery `failed` per the message model — the shim never queues, and there is no drain-on-reconnect.
-- CL-4. No assumption about session state: delivery must work whether the agent is idle or mid-turn.
+- CL-4. Delivery requires an **interactive** session ([findings](findings.md), [ADR-0015](../../decision-records/0015-claude-channels-interactive-only.md)). Idle delivery into an interactive session is confirmed. Mid-turn events queue and are grouped on the next turn.
 
 ### Outbound (session → broker)
 
@@ -51,14 +51,11 @@ States and presence semantics: [common contract](../session-lifecycle.md) · [Cl
 
 ## Risks / open questions
 
-- **Preview churn ([ADR-0007](../../decision-records/0007-accept-claude-channels-research-preview.md)).** The Claude Code channels contract is explicitly unstable. Mitigation: version-pin, keep the shim thin, maintain the fallbacks below.
+- **Preview churn ([ADR-0015](../../decision-records/0015-claude-channels-interactive-only.md)).** The Claude Code channels contract is explicitly unstable. Mitigation: version-pin, keep the shim thin. There is no secondary delivery path: if channels are unavailable in an environment, the Claude adapter is unavailable there.
 - **Reply visibility.** With chat-bridge usage of Claude Code channels, the terminal shows the inbound event and the reply tool call but not the reply text; verify how bus replies render in the session's terminal.
 - **Notification vs turn semantics.** Confirm whether a pushed event always initiates a model turn on an idle session, and how events queue mid-turn. Acceptance test required before ack semantics (CL-2) are finalized.
 
-## Fallbacks (if Claude Code channels are unavailable)
-
-1. **Headless session-resume driving**: `claude -p --resume <session-id>`, one turn per delivery. Loses the interactive TUI.
-2. **Terminal injection** (tmux `send-keys`): keeps the TUI, but fragile, ack-less, and POSIX-only ([ADR-0011](../../decision-records/0011-multiplatform-support.md)). Last resort.
+See also: [spike findings](findings.md).
 
 ## References
 

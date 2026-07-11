@@ -21,7 +21,7 @@ Known divergences on the delivery path:
 
 ## Busy signal
 
-Observable in-band: the app-server event stream shows a turn in progress (`item/*` deltas until `turn/completed`). Whether `turn/start` during an active turn is rejected or queued by the protocol is a spike question; the finding lands here and sets the broker-vs-protocol holding split.
+Observable in-band: the app-server event stream shows a turn in progress (`turn/started` and `item/*` deltas until `turn/completed`; `thread/status/changed` reports `idle`). Spike-confirmed ([findings](findings.md)): `turn/start` during an active turn is accepted but the turn never runs, so the adapter must serialize on thread-idle before delivering. All holding is the broker's; the protocol does not queue.
 
 ## Identity carrier
 

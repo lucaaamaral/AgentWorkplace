@@ -1,6 +1,8 @@
 # ADR-0007 — Accept research-preview status of Claude Code channels
 
-**Status**: Accepted
+**Status**: Superseded
+
+**Superseded by**: [ADR-0015](../0015-claude-channels-interactive-only.md)
 
 ## Context
 
@@ -19,4 +21,4 @@ Build the Claude adapter on channels anyway. Contain the risk: pin the Claude Co
 - The Claude adapter carries a stability caveat until channels exit preview; upgrades of Claude Code must be validated against the shim.
 - Fallbacks, in order of preference if channels regress or are unavailable in a given auth environment:
   1. **Headless session-resume driving** (`claude -p --resume <session-id>`): broker starts a turn per delivery; loses the interactive TUI, monitoring moves entirely to the bus's human interface.
-  2. **Terminal injection** (tmux `send-keys`): keeps the TUI but fragile and ack-less ([ADR-0003](0003-per-harness-native-push-adapters.md)); last resort.
+  2. **Terminal injection** (tmux `send-keys`): keeps the TUI but fragile and ack-less ([ADR-0003](../0003-per-harness-native-push-adapters.md)); last resort.

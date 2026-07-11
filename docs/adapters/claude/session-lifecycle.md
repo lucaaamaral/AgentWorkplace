@@ -17,7 +17,7 @@ Known divergences:
 
 ## Busy signal
 
-None known at the connection level: an MCP channel server is not told whether the session is mid-turn. How pushed events behave against a busy session (queued by the harness vs lost) is a spike question; the finding lands here and drives whether the broker ever `held`s for busy on this harness.
+None at the connection level: an MCP channel server is not told whether the session is mid-turn, and notifications carry no receipt ([findings](findings.md)). Per the Claude Code channels reference, events queue into the session and are grouped on the next turn when it is busy — so the harness absorbs the busy case and the adapter does not need a busy signal to avoid loss. Requires an interactive session ([ADR-0015](../../decision-records/0015-claude-channels-interactive-only.md)).
 
 ## Identity carrier
 

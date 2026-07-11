@@ -30,7 +30,7 @@ Protocol operations the adapter relies on:
 ### Inbound (broker → session)
 
 - CX-1. Deliver a message via `turn/start` on the agent's thread, formatted so the event identifies the bus channel, the sender, the body, and how to reply through the bus tools.
-- CX-2. If a turn is in progress: hold until `turn/completed`, then deliver — the message simply enters the session's normal input flow.
+- CX-2. Delivery must serialize on the thread: `turn/start` while a turn is in progress is accepted but the turn never runs ([findings](findings.md)). The adapter waits for the thread to be idle (`turn/completed` / `thread/status: idle`) before `turn/start`; it never fires while busy. All holding is the broker's — the protocol does not queue.
 - CX-3. Ack mapping: `turn/start` accepted → `delivered`; `turn/completed` for that turn → `processed`.
 - CX-4. `thread/inject_items` may be used for context drops that should not trigger a reaction. Use sparingly — injected items bypass the agent's explicit attention.
 - CX-5. If the app-server is unreachable while the session is still present (MCP-entry connection alive), recipients are `held`; the adapter reconnects, resumes the thread (`thread/resume`), and drains. If the session itself is disconnected, deliveries fail per the message model — no store-and-forward.
@@ -59,10 +59,12 @@ States and presence semantics: [common contract](../session-lifecycle.md) · [Co
 | Turn semantics | `turn/start` during an active turn: confirm protocol behavior (rejected vs queued) — drives CX-2 |
 | Thread unload | 30-minute idle unload is server policy (drives CX-8) |
 
+See also: [spike findings](findings.md).
+
 ## Risks / open questions
 
-- **TUI + injected turns UX.** The TUI renders turns the adapter started. Verify the human can distinguish bus-initiated turns from their own prompts (delivery formatting should make the source explicit).
-- **`turn/steer` usefulness.** The protocol allows injecting guidance mid-turn without interrupting; deliveries currently wait for `turn/completed` instead (CX-2). Evaluate later whether any delivery class justifies steer, and confirm its semantics before adopting it.
+- **TUI + injected turns UX.** The TUI renders turns the adapter started. Verify the human can distinguish bus-initiated turns from their own prompts (delivery formatting should make the source explicit). Not yet tested — the spike used single-client stdio, not a WebSocket TUI sharing the thread.
+- **`turn/steer` usefulness.** Confirmed to work (requires `expectedTurnId`; appends guidance to the active turn rather than interrupting — [findings](findings.md)). Deliveries still wait for idle (CX-2); evaluate later whether any delivery class justifies steering into a running turn.
 - **Port/endpoint management.** One app-server per agent vs one shared app-server with multiple threads — decide at implementation; per-agent isolates failures, shared simplifies discovery.
 
 ## References
