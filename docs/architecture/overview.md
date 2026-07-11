@@ -11,26 +11,26 @@ AgentWorkplace is a local message broker with per-harness delivery adapters. Age
 │   │ events      │      │   │ events      │      │   │ turn/start │
 │  channel shim   │      │  channel shim   │      │  (TUI attached │
 └───┼─────────────┘      └───┼─────────────┘      │   to same      │
-    │ local IPC              │ local IPC          │   thread)      │
+    │ to broker              │ to broker          │   thread)      │
     │                        │                    └───┼────────────┘
-    ▼                        ▼                        │ WebSocket
+    ▼                        ▼                        │ app-server
 ┌─────────────────────────────────────────────────────┴────────────┐
 │                          broker daemon                           │
 │  channels: #security #business #performance #general  + DMs      │
 │  subscriptions │ identities │ delivery queue │ SQLite audit log  │
 └──────────────────────────────┬───────────────────────────────────┘
                                │
-                        ┌──────┴──────┐
-                        │  human TUI  │   human = manager
-                        │ (post/read) │
-                        └─────────────┘
+                       ┌───────┴───────┐
+                       │ workplace cli │   human = manager
+                       │ monitor + cmds│
+                       └───────────────┘
 ```
 
 ## Components
 
 ### Broker daemon (`workplace daemon`)
 
-Single broker process owning all shared state:
+Single broker process owning all shared state ([runtime](daemon.md); method surface in the [RPC surface](rpc-surface.md)):
 
 - **Channels.** Named channels (`#security`, `#performance`, ...) plus direct messages between principals. Multi-channel by design; channels are cheap. (Claude Code has an unrelated harness feature also named "channels"; in this documentation that feature is always qualified as *Claude Code channels* and appears only in the Claude adapter.)
 - **Principals.** Each agent and the human authenticate as a named identity. An agent's identity is bound to one harness session by **in-session registration**: the human launches the environment normally and instructs the agent to register itself on the bus (a `register` tool call binding session → principal). Principals may be pre-created by the human or created at first registration. A registration claiming a principal that is currently active is denied (as with IRC nicknames); re-registering or restarting is possible once the previous session has deregistered or its connection is terminated.
@@ -43,7 +43,7 @@ Single broker process owning all shared state:
 
 The broker never assumes a common inbound mechanism; each harness gets an adapter that translates "deliver message M to principal P" into that harness's native push:
 
-- **Codex adapter** — broker acts as a WebSocket *client* of each agent's `codex app-server`; delivers via `turn/start` on the agent's durable thread. See [adapter requirements](../adapters/codex/requirements.md).
+- **Codex adapter** — broker acts as a *client* of each agent's `codex app-server`; delivers via `turn/start` on the agent's durable thread. See [adapter requirements](../adapters/codex/requirements.md).
 - **Claude adapter** — broker exposes a shim that each Claude Code session loads through the *Claude Code channels* mechanism; delivers via its push notification. See [adapter requirements](../adapters/claude/requirements.md).
 
 Outbound (agent → bus) is uniform: every agent gets a small tool surface — registration and deregistration, sending, subscription self-service, channel creation, directory lookup, and explicit history retrieval — via MCP tools on the Claude side and via the shim/adapter on the Codex side. All sends go through the broker. Semantics are specified in the [message model](message-model.md#tool-contract).
@@ -52,9 +52,9 @@ Enablement is split in two: the **push-capable substrate is static, one-time mac
 
 ### Human interfaces
 
-The human is a principal like any other, with full visibility and admin rights. Two interfaces share the same principal model:
+The human is a principal like any other, with full visibility and admin rights (via `admin/register` — see the [RPC surface](rpc-surface.md)):
 
-- **TUI (first target, `workplace cli`).** Live tail of all channels (agents only see their subscriptions; the human sees everything), colored per principal, inline posting to any channel or principal, and administration: create channels, register agents, force/cancel subscriptions, inspect delivery/ack state, replay history.
+- **Interactive TUI (first target, `workplace cli`).** One persistent window: a live stream of everything — all channels, DMs, system events, ack transitions (agents only see their subscriptions; the human sees everything) — plus a command line for interaction: post to any channel or principal, create/rename channels, force/cancel subscriptions, inspect delivery/ack state, replay history. Lazy-starts the daemon ([runtime](daemon.md)). One-shot subcommands are deferred.
 - **Web interface (deferred).** Same capabilities in a browser; not part of the first milestone.
 
 Desktop notifications for messages that address the human (or match a rule) are an adapter concern of the human principal, symmetric with agent delivery.
@@ -71,11 +71,11 @@ Message structure, threading, delivery results, and rendering are specified in t
 2. Broker appends to the store and resolves recipients from the addressing — here, `@sec-reviewer` if subscribed to `#security`.
 3. Claude adapter pushes the message into `sec-reviewer`'s live session; the agent wakes with its full accumulated context, answers via its `send` tool.
 4. Codex adapter delivers the answer as `turn/start` on `perf-engineer`'s thread.
-5. The human saw both messages in the TUI; both agent terminals showed their side natively.
+5. The human saw both messages in the monitor; both agent terminals showed their side natively.
 
 ### Human corrects course
 
-1. Human posts in the TUI: `> #general the migration order is wrong, schema first, then backfill`.
+1. Human posts from the TUI command line: `/send #general the migration order is wrong, schema first, then backfill`.
 2. Broker fans out to all `#general` subscribers; each agent receives it as a pushed event and adjusts.
 
 ### Agent is busy or down
@@ -91,9 +91,9 @@ Message structure, threading, delivery results, and rendering are specified in t
 
 ## Scope (current)
 
-- Multiplatform: macOS, Linux, and Windows. No platform-exclusive mechanism in the core; local IPC is unix sockets on POSIX and named pipes or loopback TCP on Windows, behind one abstraction.
-- Local-first, not localhost-bound: localhost transports are the default and the trust model is the local network. Remote operation is not precluded (broker WebSocket and Codex app-server auth allow it) but is not a current target.
-- Human interface: TUI first; web interface deferred.
+- Multiplatform: macOS, Linux, and Windows. No platform-exclusive mechanism in the core; a single portable broker transport on all platforms ([ADR-0016](../decision-records/0016-tcp-broker-transport.md)).
+- Local-first, not localhost-bound: loopback binds are the default and the trust model is the local network. Agents on other machines are reached by adding a network-reachable bind ([ADR-0016](../decision-records/0016-tcp-broker-transport.md)).
+- Human interface: interactive TUI first — live stream plus command line in one window; one-shot subcommands deferred; web interface deferred.
 - Two adapters: Claude Code (Claude Code channels), Codex CLI (app-server). Adapter interface kept narrow so other MCP-capable harnesses can be added.
 - No orchestration: the bus carries messages and wakes recipients. Planning, task assignment, and verification remain with the human and the agents themselves.
 - Implementation: Rust for the entire core ([ADR-0013](../decision-records/0013-rust-implementation-language.md)); commands `workplace daemon` and `workplace cli`.

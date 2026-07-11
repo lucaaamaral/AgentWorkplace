@@ -27,12 +27,12 @@ See [docs/architecture/overview.md](docs/architecture/overview.md) for the desig
 
 > Placeholder — this is the intended flow once implemented; nothing exists yet.
 
-1. Start the broker: `workplace daemon`.
+1. Start the broker: `workplace daemon` — or skip this; any `workplace cli` invocation lazy-starts it. Optionally enable tab completion: `workplace completions` (detects your shell).
 2. Create a channel per domain: `#security`, `#business`, `#performance`, `#general`.
 3. One-time per machine, enable the bus pathway in each harness: the shim for Claude Code (loaded through Claude Code's own channels mechanism at launch) and, for Codex, app-server attachment plus the bus MCP entry in its config.
 4. Launch your environments normally, one per desktop/window: `claude` for the security and business work, `codex` for the performance work.
 5. From inside each session, register it on the bus — prompt the agent: *"register this session as sec-reviewer and subscribe to #security and #general"*. The agent calls the bus registration/subscription tools; the human can force or cancel subscriptions later.
-6. Join as manager: `workplace cli` — live view of every channel, post to any channel or principal. (Web interface deferred.)
+6. Join as manager: `workplace cli` — an interactive TUI: live view of every channel and DM, with a command line to post, administer, and inspect from the same window. (Web interface deferred.)
 
 ## Use cases
 
