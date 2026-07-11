@@ -65,7 +65,7 @@ level = "info"
 
 ## Storage engine
 
-The store ([ADR-0005](../decision-records/0005-broker-owned-append-only-audit-log.md)) is **SQLite embedded in the daemon** via `rusqlite` with the `bundled` feature: the SQLite amalgamation is compiled into the `workplace` binary, so there is no system dependency and behavior is identical on all three platforms. Licensing is unencumbered: SQLite is public domain (no attribution, no copyleft); `rusqlite` is MIT.
+The store ([ADR-0005](../decision-records/0005-broker-owned-append-only-audit-log.md)) is **SQLite embedded in the daemon** — compiled into the `workplace` binary, no system dependency, single-writer through the broker only. Rationale, options considered, and constraints: [ADR-0017](../decision-records/0017-embedded-sqlite-storage.md).
 
 ## Shell completions
 

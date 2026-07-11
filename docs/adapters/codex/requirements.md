@@ -65,7 +65,7 @@ See also: [spike findings](findings.md).
 
 - **TUI + injected turns UX.** The TUI renders turns the adapter started. Verify the human can distinguish bus-initiated turns from their own prompts (delivery formatting should make the source explicit). Not yet tested — the spike used single-client stdio, not a WebSocket TUI sharing the thread.
 - **`turn/steer` usefulness.** Confirmed to work (requires `expectedTurnId`; appends guidance to the active turn rather than interrupting — [findings](findings.md)). Deliveries still wait for idle (CX-2); evaluate later whether any delivery class justifies steering into a running turn.
-- **Port/endpoint management.** One app-server per agent vs one shared app-server with multiple threads — decide at implementation; per-agent isolates failures, shared simplifies discovery.
+- **Delivery-path discovery at registration.** The initiative is the harness's: registration arrives through the session's bus MCP entry, and must carry the delivery path the adapter records — app-server endpoint and thread id (CX-7). How the MCP entry learns them (endpoint from the one-time setup config it is launched with; thread id via `thread/list` metadata matching) is an implementation/spike detail. One app-server per agent vs one shared app-server with many threads is a deployment choice the adapter is agnostic to — it dials whatever registration reports.
 
 ## References
 
