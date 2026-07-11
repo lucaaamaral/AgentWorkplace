@@ -19,7 +19,7 @@ Claude Code TUI ── stdio ── channel shim ── local IPC ── broker
 
 - CL-1. Translate broker delivery into a `notifications/claude/channel` notification on the session's stdio connection, formatted so the event identifies the bus channel, the sender, the body, and how to reply through the bus tools.
 - CL-2. Report acknowledgment to the broker: at minimum "notification emitted into session"; "turn started" if the protocol surfaces it.
-- CL-3. Events can only reach an open session. When the shim is not connected, publishes must not fail — the broker queues; the shim drains on (re)connect.
+- CL-3. Events can only reach an open session. When the shim is not connected the recipient is disconnected: the broker marks the delivery `failed` per the message model — the shim never queues, and there is no drain-on-reconnect.
 - CL-4. No assumption about session state: delivery must work whether the agent is idle or mid-turn.
 
 ### Outbound (session → broker)
@@ -27,6 +27,8 @@ Claude Code TUI ── stdio ── channel shim ── local IPC ── broker
 - CL-5. The shim exposes the bus tool surface (defined in the overview) to the session as MCP tools; all outbound traffic goes over the shim's broker connection — the shim must not provide any path that bypasses the broker.
 
 ### Session binding
+
+States and presence semantics: [common contract](../session-lifecycle.md) · [Claude Code specifics](session-lifecycle.md).
 
 - CL-6. One shim instance per session. The session connects anonymous; after in-session registration the shim carries the session→principal binding for all subsequent traffic.
 - CL-7. On connect and on registration, the shim reports session metadata (cwd, harness version, pid) for liveness display.

@@ -41,23 +41,26 @@ Threading is by **thread id**, not by per-message reply pointers.
 
 A delivered message does **not** oblige a reply. Agents answer when an answer is explicitly requested, or when they judge one useful; the conventions snippet installed at setup states this. Message-level "answer requested" signaling is prose, not an envelope field.
 
-## Acknowledgment lifecycle *(provisional until spikes)*
+## Acknowledgment lifecycle
 
-Per-recipient delivery state, inspectable by the human:
+Per-recipient delivery state, inspectable by the human. Session presence — how the broker knows a recipient is there at all — is harness territory, defined in the [session lifecycle](../adapters/session-lifecycle.md); presence gates `held` ↔ deliverable but never advances a message beyond that. Each state is advanced only by the layer that can actually observe it:
 
 | State | Meaning | Source |
 | --- | --- | --- |
-| `held` | In the broker; recipient not currently deliverable (session down, or busy and harness not accepting input) | broker |
-| `relayed` | Handed to the harness's message flow | adapter (Claude: notification emitted; Codex: `turn/start` accepted) |
-| `processed` | The recipient's harness completed a turn that included the message | adapter (Codex: `turn/completed`; Claude side unknown — spike) |
-| `failed` | Relay errored (harness rejected the injection); adapter error retained | adapter |
+| `held` | In the broker; recipient not currently delivered | broker |
+| `relayed` | Handed to the harness's message flow | broker delivery attempt |
+| `processed` | The recipient's harness completed a turn that included the message | adapter confirmation |
+| `failed` | Relay errored; adapter error retained and visible to the human | adapter / broker |
 
-Per-harness asymmetry is explicitly permitted: if a harness cannot observe processing, its recipients top out at `relayed`. `processed` means "the harness ran a turn", never "the agent acted on it" — no state name may suggest comprehension. Final names and transitions are fixed after the spikes.
+- Per-harness asymmetry is accepted and displayed honestly: `relayed` might be a protocol fact or a transport fact; the human interface shows what is known without faking uniformity.
+- `processed` means "the harness ran a turn", never "the agent acted on it" — no state name may suggest comprehension.
+- A "subsequent bus tool call implies processed" heuristic for Claude was considered and **deliberately not adopted**: it would display inference as fact. Revisit only if the human interface proves blind in practice.
 
 ## Send results and errors
 
 - **Unknown names are errors**: a send referencing a channel or principal that does not exist fails, and nothing is stored — an unknown name is a typo, not an empty audience.
 - **Empty audiences are reported, not errored**: a send to a channel with no subscribers, or an intersection that resolves to nobody, succeeds with a delivery report stating zero recipients and why (no subscribers vs empty intersection). The message is stored — it happened, even if nobody heard it.
+- **Disconnected recipients fail**: there is no store-and-forward across sessions. A resolved recipient with no active session is marked `failed` (reason: disconnected) — the send still succeeds and the message is stored, and the delivery report states it ("delivered to N, failed for M").
 - **Broker unreachable is an error to the model**: if the daemon is down, the send tool call fails with an explicit error surfaced to the agent; never silent loss.
 
 ## Delivery rendering
@@ -108,4 +111,4 @@ Semantics of the agent-facing tool surface, uniform across harnesses. Exact tool
 
 ## Open items
 
-1. **Ack lifecycle finalization** — after the harness spikes.
+1. **Harness behavior confirmations (spikes).** The state model above is decided; what the spikes may still adjust is mechanics: Claude — whether a pushed event starts a turn on an idle session and how events queue mid-turn; Codex — what `turn/start` does during an active turn (rejected vs queued), which determines how much holding the broker performs versus the protocol. Findings are documented under `docs/adapters/`.

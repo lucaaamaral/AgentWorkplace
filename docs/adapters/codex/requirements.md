@@ -33,13 +33,15 @@ Protocol operations the adapter relies on:
 - CX-2. If a turn is in progress: hold until `turn/completed`, then deliver — the message simply enters the session's normal input flow.
 - CX-3. Ack mapping: `turn/start` accepted → `delivered`; `turn/completed` for that turn → `processed`.
 - CX-4. `thread/inject_items` may be used for context drops that should not trigger a reaction. Use sparingly — injected items bypass the agent's explicit attention.
-- CX-5. If the app-server is unreachable, publishes must not fail — the broker queues; on reconnect the adapter resumes the thread (`thread/resume`) and drains.
+- CX-5. If the app-server is unreachable while the session is still present (MCP-entry connection alive), recipients are `held`; the adapter reconnects, resumes the thread (`thread/resume`), and drains. If the session itself is disconnected, deliveries fail per the message model — no store-and-forward.
 
 ### Outbound (session → broker)
 
 - CX-6. The bus tool surface (defined in the overview) is exposed to the session as a bus MCP server entry in `~/.codex/config.toml` (`[mcp_servers.*]`), installed by one-time setup. All outbound traffic goes through the broker.
 
 ### Session binding and thread lifecycle
+
+States and presence semantics: [common contract](../session-lifecycle.md) · [Codex specifics](session-lifecycle.md).
 
 - CX-7. The human starts the Codex environment normally, attached to an app-server (one-time setup provides the config/alias); no wrapper. On in-session registration, the call must carry enough to identify the session (thread id, or metadata resolved via `thread/list`); the adapter records `(principal, app-server endpoint, thread id)` and attaches as a client for delivery.
 - CX-8. Threads unload after ~30 idle minutes with no subscribers (`thread/closed` notification). This is normal, not an error; the adapter must `thread/resume` transparently on next delivery — history is preserved.
