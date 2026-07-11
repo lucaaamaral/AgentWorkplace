@@ -1,0 +1,89 @@
+AgentWorkplace License, Version 1.0
+
+Copyright (c) 2026 Lucas Amaral
+
+1. Definitions.
+
+   "License" means the terms and conditions for use, reproduction, and
+   distribution set out in this document.
+
+   "Licensor" means the copyright owner, Lucas Amaral, or an entity
+   authorized by the copyright owner to grant this License.
+
+   "Work" means the software and accompanying materials made available
+   under this License, including source code, object code, documentation,
+   architecture and design documents, and decision records.
+
+   "Derivative Work" means any work, in source or any other form, that is
+   based on or derived from the Work, including translations, adaptations,
+   and modifications, and any software whose design or implementation
+   reproduces, in whole or in substantial part, the design documented in
+   the Work, whether or not literal content is copied.
+
+   "You" (or "Your") means an individual or legal entity exercising
+   permissions granted by this License.
+
+2. Grant of Copyright License.
+
+   Subject to the terms and conditions of this License, the Licensor
+   grants You a worldwide, royalty-free, non-exclusive, perpetual license
+   to use, reproduce, modify, display, perform, distribute, and sublicense
+   the Work and Derivative Works thereof, in source or compiled form.
+
+3. Conditions.
+
+   The grant in Section 2 is conditioned on all of the following:
+
+   (a) Notice retention. You must retain, in the Work and in any
+       Derivative Work, all copyright, license, and attribution notices
+       present in the Work, and You must include a copy of this License
+       with any distribution of the Work or a Derivative Work.
+
+   (b) Acknowledgement. Any Derivative Work, and any product or project
+       that incorporates the Work or any part of it, must include a
+       prominent acknowledgement in its documentation — and, where a
+       credits or about section exists, in that section — stating that it
+       is based on or incorporates AgentWorkplace by Lucas Amaral, with a
+       reference to the source repository or its successor location.
+
+   (c) Marking of changes. Files You modify must carry prominent notices
+       stating that You changed them.
+
+4. Reimplementations.
+
+   For the avoidance of doubt, the acknowledgement condition in
+   Section 3(b) applies equally to reimplementations produced by studying
+   the Work or its documentation, including so-called clean-room
+   implementations, to the fullest extent permitted by applicable law.
+
+5. Trademarks.
+
+   This License does not grant permission to use the name "AgentWorkplace"
+   or the name of the Licensor, except as required for the acknowledgement
+   described in Section 3(b) and for reasonable and customary use in
+   describing the origin of the Work.
+
+6. Termination.
+
+   Your rights under this License terminate automatically if You fail to
+   comply with its terms. Rights granted to third parties who received the
+   Work or Derivative Works from You in compliance with this License
+   survive such termination.
+
+7. Disclaimer of Warranty.
+
+   THE WORK IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+   IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+   FITNESS FOR A PARTICULAR PURPOSE, AND NONINFRINGEMENT.
+
+8. Limitation of Liability.
+
+   IN NO EVENT SHALL THE LICENSOR BE LIABLE FOR ANY CLAIM, DAMAGES, OR
+   OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT, OR OTHERWISE,
+   ARISING FROM, OUT OF, OR IN CONNECTION WITH THE WORK OR THE USE OF OR
+   OTHER DEALINGS IN THE WORK.
+
+9. Severability.
+
+   If any provision of this License is held to be unenforceable, the
+   remaining provisions shall remain in full force and effect.
