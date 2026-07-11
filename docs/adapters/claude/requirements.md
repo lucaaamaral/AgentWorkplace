@@ -9,8 +9,7 @@ Claude Code's only sanctioned push path into a running session is its **Claude C
 The adapter is therefore a **shim**: a minimal channel-plugin process bridging Claude Code's stdio protocol to the broker.
 
 ```
-Claude Code TUI ── stdio ── channel shim ── local IPC ── broker
-                            (unix socket on POSIX, named pipe/loopback TCP on Windows)
+Claude Code TUI ── stdio ── channel shim ── broker connection ── broker
 ```
 
 ## Adapter requirements

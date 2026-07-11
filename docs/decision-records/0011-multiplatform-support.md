@@ -10,7 +10,7 @@ Agent workstations run on all three major desktop platforms. Some mechanisms dis
 
 macOS, Linux, and Windows are all supported targets. The core (broker, adapters, TUI) must not depend on a platform-exclusive mechanism without an equivalent on the other platforms:
 
-- **Local IPC** is an abstraction: unix domain sockets on POSIX, named pipes or loopback TCP on Windows.
+- **Broker transport** is a single mechanism portable across all three platforms ([ADR-0016](0016-tcp-broker-transport.md)).
 - **Delivery paths are inherently portable**: Codex app-server WebSocket and Claude Code channels (stdio subprocess) work on all three platforms.
 - Implementation language/runtime must have first-class support on all three platforms (constraint on the future implementation choice).
 

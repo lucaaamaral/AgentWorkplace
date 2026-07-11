@@ -16,6 +16,6 @@ The workflow remains local-first: localhost is the default and remote hosts are 
 
 ## Consequences
 
-- Transport choices must work across hosts from day one: WebSocket/TCP for broker connections where cross-host is plausible; purely local IPC (unix sockets, named pipes) only for components that are inherently machine-local, such as the Claude channel shim spawned by the session.
-- No redesign needed for a networked setup: the Codex app-server already supports WebSocket with bearer/JWT auth; the broker exposes the same options.
+- Transport choices must work across hosts from day one (broker transport decided in [ADR-0016](0016-tcp-broker-transport.md)).
+- No redesign needed for a networked setup: the Codex app-server already supports WebSocket with bearer/JWT auth, and the broker reaches other hosts by configuration alone.
 - Security posture is explicit: within the local network, principals are trusted to be who they claim beyond token checks; hostile-network operation is a future ADR.

@@ -14,7 +14,7 @@ Rationale:
 
 - Memory safety without a garbage collector on the untrusted-input parsing surface.
 - First-class cross-platform toolchain and cross-compilation for all three target platforms; single static binaries.
-- The ecosystem covers every component directly: async runtime (tokio), JSON/JSON-RPC (serde), SQLite (rusqlite), WebSocket (tokio-tungstenite), TUI (ratatui), and cross-platform local IPC (unix sockets/named pipes) crates.
+- The ecosystem covers every component directly: async runtime (tokio), JSON/JSON-RPC (serde), SQLite (rusqlite), WebSocket (tokio-tungstenite), and TUI (ratatui) crates.
 - Maintainer goal: gaining Rust exposure. Recorded as a real input to the decision, not an afterthought.
 
 Rejected:

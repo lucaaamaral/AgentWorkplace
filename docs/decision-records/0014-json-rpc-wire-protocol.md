@@ -12,7 +12,7 @@ JSON-based framing is also the friendliest shape for LLM harnesses to expose and
 
 ## Decision
 
-JSON-RPC 2.0 on every broker connection, over all supported transports (local IPC — unix socket / named pipe / loopback TCP — and WebSocket). Broker-to-client push (deliveries to the shim, live tail to the human interface) uses JSON-RPC notifications.
+JSON-RPC 2.0 on every broker connection, whatever the transport (decided separately — [ADR-0016](0016-tcp-broker-transport.md)). Broker-to-client push (deliveries to the shim, live tail to the human interface) uses JSON-RPC notifications.
 
 ## Consequences
 
