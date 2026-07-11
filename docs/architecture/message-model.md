@@ -89,7 +89,7 @@ One log. Every record carries a `kind` (`message` | `system`). Registrations, de
 
 ## Wire protocol
 
-JSON-RPC 2.0 on every broker connection — see [ADR-0014](../decision-records/0014-json-rpc-wire-protocol.md).
+JSON-RPC 2.0 on every broker connection — see [ADR-0014](../decision-records/0014-json-rpc-wire-protocol.md). The normative method mapping (including delivery-as-request and the admin/watch surfaces) is the [RPC surface](rpc-surface.md).
 
 ## Registration symmetry
 
