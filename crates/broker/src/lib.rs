@@ -26,6 +26,14 @@ pub struct BrokerConfig {
     /// Version string surfaced in session/hello and daemon/status (sourced
     /// from the top-level VERSION file by the binary).
     pub version: String,
+    /// Shared-secret token every session must present in session/hello.
+    /// None = open broker (loopback-only trust model; set one before adding
+    /// a network-reachable listener).
+    pub auth_token: Option<String>,
+    /// Capability-token file for the shared codex app-server (`--ws-auth
+    /// capability-token --ws-token-file`). When set, CodexAttach presents its
+    /// contents as `Authorization: Bearer` on the WebSocket upgrade.
+    pub codex_token_file: Option<PathBuf>,
 }
 
 impl Default for BrokerConfig {
@@ -36,6 +44,8 @@ impl Default for BrokerConfig {
             message_size_limit: 8 * 1024 * 1024,
             grace_window: Duration::from_secs(60),
             version: include_str!("../../../VERSION").trim().into(),
+            auth_token: None,
+            codex_token_file: None,
         }
     }
 }
