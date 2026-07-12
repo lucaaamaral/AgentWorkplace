@@ -34,6 +34,11 @@ pub struct BrokerConfig {
     /// capability-token --ws-token-file`). When set, CodexAttach presents its
     /// contents as `Authorization: Bearer` on the WebSocket upgrade.
     pub codex_token_file: Option<PathBuf>,
+    /// Per-session outbound queue bound (messages queued but not yet written):
+    /// a peer that stops reading is disconnected once its queue reaches this,
+    /// instead of growing without limit. Tests lower it to trip the guard
+    /// deterministically.
+    pub max_out_queue: usize,
 }
 
 impl Default for BrokerConfig {
@@ -46,6 +51,7 @@ impl Default for BrokerConfig {
             version: include_str!("../../../VERSION").trim().into(),
             auth_token: None,
             codex_token_file: None,
+            max_out_queue: 8192,
         }
     }
 }

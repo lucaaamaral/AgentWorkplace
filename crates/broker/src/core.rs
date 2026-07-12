@@ -18,10 +18,6 @@ const DELETE_TOKEN_TTL: Duration = Duration::from_secs(30);
 /// Backoff cap for held Codex deliveries whose app-server is unreachable
 /// while the recipient's session is still present (CX-5).
 const CODEX_RETRY_MAX: Duration = Duration::from_secs(30);
-/// Per-session outbound queue bound: a peer that stops reading while the
-/// broker keeps producing (watch floods) is disconnected rather than allowed
-/// to grow the queue without limit.
-const MAX_OUT_QUEUE: usize = 8192;
 
 #[derive(Clone, Default)]
 pub enum WatchFilter {
@@ -51,6 +47,8 @@ pub struct Session {
     /// Messages queued for the writer but not yet written; the writer task
     /// decrements. Bounds per-session outbound memory (slow-reader defense).
     pub(crate) queued: Arc<std::sync::atomic::AtomicUsize>,
+    /// Queue bound (BrokerConfig::max_out_queue, captured at attach).
+    max_out_queue: usize,
     overflow: std::sync::atomic::AtomicBool,
     /// Fired once when the outbound queue overflows, so the connection loop
     /// wakes even while blocked on an idle reader.
@@ -78,17 +76,18 @@ impl Session {
         }
         // Reserve the slot atomically: concurrent senders must not overshoot
         // the bound.
+        let limit = self.max_out_queue;
         let reserved = self
             .queued
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |q| {
-                (q < MAX_OUT_QUEUE).then_some(q + 1)
+                (q < limit).then_some(q + 1)
             })
             .is_ok();
         if !reserved {
             if !self.overflow.swap(true, Ordering::Relaxed) {
                 tracing::warn!(
                     session = self.id,
-                    "outbound queue overflow ({MAX_OUT_QUEUE} unread messages); dropping session"
+                    "outbound queue overflow ({limit} unread messages); dropping session"
                 );
                 // notify_one stores a permit, so the connection loop wakes
                 // even if it enters its select after this fires.
@@ -236,6 +235,7 @@ impl Broker {
             next_req_id: AtomicU64::new(1),
             pending: Mutex::new(HashMap::new()),
             queued: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            max_out_queue: self.0.cfg.max_out_queue,
             overflow: std::sync::atomic::AtomicBool::new(false),
             overflow_notify: tokio::sync::Notify::new(),
         });

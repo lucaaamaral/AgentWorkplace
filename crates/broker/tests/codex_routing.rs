@@ -334,6 +334,7 @@ async fn start_broker_with_token(
         version: "test".into(),
         auth_token: None,
         codex_token_file,
+        max_out_queue: 8192,
     })
     .unwrap();
     tokio::spawn(server::serve_listener(broker.clone(), listener));

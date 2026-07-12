@@ -32,6 +32,7 @@ fn test_cfg() -> BrokerConfig {
         version: "test".into(),
         auth_token: None,
         codex_token_file: None,
+        max_out_queue: 8192,
     }
 }
 
@@ -977,7 +978,15 @@ async fn jsonrpc_violations_get_spec_errors() {
 
 #[tokio::test]
 async fn slow_reader_overflow_disconnects() {
-    let (addr, _broker) = start_broker(test_cfg()).await;
+    // The overflow guard trips when messages queue IN the broker, which
+    // requires the writer to be blocked on full kernel socket buffers. Linux
+    // loopback buffers auto-tune to several MB, so tiny events never build
+    // backpressure there: use a small queue bound plus quarter-megabyte
+    // events so the flood (~37MB) dwarfs any platform's buffering.
+    let mut cfg = test_cfg();
+    cfg.message_size_limit = 512 * 1024;
+    cfg.max_out_queue = 64;
+    let (addr, _broker) = start_broker(cfg).await;
 
     // A watcher that subscribes to everything and then never reads.
     let mut watcher = Client::connect_hello(addr).await;
@@ -990,14 +999,12 @@ async fn slow_reader_overflow_disconnects() {
         .await
         .unwrap();
 
-    // Push well past the outbound bound (8192) plus what kernel socket
-    // buffers can absorb: each send produces one watch event for the
-    // non-reading watcher.
-    for _ in 0..12_000 {
+    let body = "x".repeat(256 * 1024);
+    for _ in 0..150 {
         sender
             .call(
                 m::MESSAGE_SEND,
-                json!({ "channels": ["#flood"], "body": "x" }),
+                json!({ "channels": ["#flood"], "body": body }),
             )
             .await
             .unwrap();

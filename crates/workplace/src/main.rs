@@ -105,6 +105,7 @@ fn run_daemon(cfg: config::ConfigFile) -> anyhow::Result<()> {
         version: version(),
         auth_token: cfg.broker.auth_token.clone(),
         codex_token_file: cfg.codex.token_file.clone(),
+        max_out_queue: broker::BrokerConfig::default().max_out_queue,
     };
     let codex_app_server = cfg.codex.app_server.clone();
     let codex_token_file = cfg.codex.token_file.clone();
