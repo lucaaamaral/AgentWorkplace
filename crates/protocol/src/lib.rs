@@ -20,6 +20,8 @@ pub const DEFAULT_PORT: u16 = 9675;
 pub enum Id {
     Num(u64),
     Str(String),
+    /// JSON-RPC parse/invalid-request errors carry `"id": null`.
+    Null,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -68,7 +70,12 @@ impl Message {
     /// Classify one NDJSON line. JSON-RPC distinguishes the three shapes by
     /// the presence of `method` and `id`.
     pub fn parse(line: &str) -> Result<Message, serde_json::Error> {
-        let v: Value = serde_json::from_str(line)?;
+        Message::from_value(serde_json::from_str(line)?)
+    }
+
+    /// Classify an already-parsed JSON value. Lets transports distinguish a
+    /// syntax error (-32700) from valid JSON with an invalid shape (-32600).
+    pub fn from_value(v: Value) -> Result<Message, serde_json::Error> {
         let has_method = v.get("method").is_some();
         let has_id = v.get("id").map(|i| !i.is_null()).unwrap_or(false);
         if has_method && has_id {
@@ -117,7 +124,12 @@ pub fn ok_response(id: Id, result: impl Serialize) -> Response {
 }
 
 pub fn err_response(id: Id, error: RpcError) -> Response {
-    Response { jsonrpc: "2.0".into(), id, result: None, error: Some(error) }
+    Response {
+        jsonrpc: "2.0".into(),
+        id,
+        result: None,
+        error: Some(error),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -135,6 +147,8 @@ pub enum ErrorCode {
     ShuttingDown,
     ScopeDenied,
     BadConfirmation,
+    Unauthorized,
+    OverrideDenied,
 }
 
 impl ErrorCode {
@@ -149,6 +163,8 @@ impl ErrorCode {
             ErrorCode::ShuttingDown => -32006,
             ErrorCode::ScopeDenied => -32007,
             ErrorCode::BadConfirmation => -32008,
+            ErrorCode::Unauthorized => -32009,
+            ErrorCode::OverrideDenied => -32010,
         }
     }
 
@@ -163,6 +179,8 @@ impl ErrorCode {
             ErrorCode::ShuttingDown => "SHUTTING_DOWN",
             ErrorCode::ScopeDenied => "SCOPE_DENIED",
             ErrorCode::BadConfirmation => "BAD_CONFIRMATION",
+            ErrorCode::Unauthorized => "UNAUTHORIZED",
+            ErrorCode::OverrideDenied => "OVERRIDE_DENIED",
         }
     }
 
@@ -263,18 +281,54 @@ impl Record {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum SystemEvent {
-    Registered { principal: String, admin: bool },
-    RegistrationDenied { name: String, reason: String },
-    Deregistered { principal: String },
-    Disconnected { principal: String },
-    Subscribed { principal: String, channel: String, by_admin: bool },
-    Unsubscribed { principal: String, channel: String, by_admin: bool },
-    ChannelCreated { channel: String, by: String },
-    ChannelRenamed { old_name: String, new_name: String, by: String },
-    ChannelArchived { channel: String, by: String },
-    ChannelUnarchived { channel: String, by: String },
+    Registered {
+        principal: String,
+        admin: bool,
+    },
+    RegistrationDenied {
+        name: String,
+        reason: String,
+    },
+    Deregistered {
+        principal: String,
+    },
+    Disconnected {
+        principal: String,
+    },
+    Subscribed {
+        principal: String,
+        channel: String,
+        by_admin: bool,
+    },
+    Unsubscribed {
+        principal: String,
+        channel: String,
+        by_admin: bool,
+    },
+    ChannelCreated {
+        channel: String,
+        by: String,
+    },
+    ChannelRenamed {
+        old_name: String,
+        new_name: String,
+        by: String,
+    },
+    ChannelArchived {
+        channel: String,
+        by: String,
+    },
+    ChannelUnarchived {
+        channel: String,
+        by: String,
+    },
     /// Deletion tombstone (ADR-0018): permanent record of what was redacted.
-    ChannelDeleted { channel_id: u64, name: String, record_count: u64, by: String },
+    ChannelDeleted {
+        channel_id: u64,
+        name: String,
+        record_count: u64,
+        by: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -342,6 +396,9 @@ pub struct ClientInfo {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HelloParams {
     pub client_info: ClientInfo,
+    /// Shared-secret token; required when the broker is configured with one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_token: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -350,9 +407,23 @@ pub struct HelloResult {
     pub session_id: u64,
 }
 
+/// Delivery coordinates for a Codex-harness principal (CX-7): the shared
+/// app-server the broker dials and the agent's thread. Self-reported at
+/// registration (the agent reads its own $CODEX_THREAD_ID).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CodexCoordinates {
+    /// WebSocket endpoint of the shared `codex app-server --listen`.
+    pub app_server: String,
+    pub thread_id: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RegisterParams {
     pub name: String,
+    /// Present when the registering session is a Codex agent: deliveries are
+    /// then injected via the app-server instead of the registering connection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codex: Option<CodexCoordinates>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -528,6 +599,26 @@ pub struct ProcessedParams {
 }
 
 // ---------------------------------------------------------------------------
+// Delivery rendering (message-model.md, "Delivery rendering")
+// ---------------------------------------------------------------------------
+
+/// Render an envelope as the structured block adapters hand to a harness:
+/// identifies the bus channel(s), the sender, the thread, the body, and how
+/// to reply through the bus tools.
+pub fn render_delivery(e: &Envelope) -> String {
+    let via = if e.recipients.channels.is_empty() {
+        "(direct message)".to_string()
+    } else {
+        e.recipients.channels.join(" ")
+    };
+    format!(
+        "Bus message on {via} from {} (thread {}):\n\n{}\n\nTo reply, call the send tool with \
+         thread_id {} addressed to the originating channel and/or sender.",
+        e.sender, e.thread_id, e.body, e.thread_id
+    )
+}
+
+// ---------------------------------------------------------------------------
 // Names (message-model.md, Identifiers and naming)
 // ---------------------------------------------------------------------------
 
@@ -535,7 +626,9 @@ pub struct ProcessedParams {
 pub fn valid_channel_name(name: &str) -> bool {
     name.strip_prefix('#').is_some_and(|rest| {
         !rest.is_empty()
-            && rest.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+            && rest
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
     })
 }
 
@@ -543,7 +636,9 @@ pub fn valid_channel_name(name: &str) -> bool {
 pub fn valid_principal_name(name: &str) -> bool {
     name.strip_prefix('@').is_some_and(|rest| {
         !rest.is_empty()
-            && rest.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+            && rest
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
     })
 }
 
@@ -556,9 +651,15 @@ mod tests {
         let req = r#"{"jsonrpc":"2.0","id":1,"method":"session/hello","params":{}}"#;
         assert!(matches!(Message::parse(req).unwrap(), Message::Request(_)));
         let notif = r#"{"jsonrpc":"2.0","method":"watch/event","params":{}}"#;
-        assert!(matches!(Message::parse(notif).unwrap(), Message::Notification(_)));
+        assert!(matches!(
+            Message::parse(notif).unwrap(),
+            Message::Notification(_)
+        ));
         let resp = r#"{"jsonrpc":"2.0","id":1,"result":{}}"#;
-        assert!(matches!(Message::parse(resp).unwrap(), Message::Response(_)));
+        assert!(matches!(
+            Message::parse(resp).unwrap(),
+            Message::Response(_)
+        ));
         let err = r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"x"}}"#;
         assert!(matches!(Message::parse(err).unwrap(), Message::Response(_)));
     }
@@ -571,7 +672,10 @@ mod tests {
                 thread_id: 7,
                 timestamp: 123,
                 sender: "@a".into(),
-                recipients: Recipients { channels: vec!["#g".into()], principals: vec![] },
+                recipients: Recipients {
+                    channels: vec!["#g".into()],
+                    principals: vec![],
+                },
                 body: "hi".into(),
                 truncated: false,
             },
@@ -585,7 +689,10 @@ mod tests {
         let sys = Record::System {
             id: 8,
             timestamp: 124,
-            event: SystemEvent::Registered { principal: "@a".into(), admin: false },
+            event: SystemEvent::Registered {
+                principal: "@a".into(),
+                admin: false,
+            },
         };
         let v = serde_json::to_value(&sys).unwrap();
         assert_eq!(v["kind"], "system");
