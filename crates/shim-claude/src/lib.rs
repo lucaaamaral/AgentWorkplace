@@ -14,16 +14,15 @@
 //! lifecycle "Broker restart").
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use protocol::methods as m;
 use protocol::{
-    request, ClientInfo, DeliverParams, DeliverResult, HelloParams, Id, Message, RegisterParams,
-    Response, RpcError,
+    ClientInfo, DeliverParams, DeliverResult, HelloParams, Id, Message, Response, RpcError, request,
 };
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot};
@@ -43,6 +42,12 @@ self-contained; a delivered message does not oblige a reply unless one is reques
 pub struct ShimConfig {
     pub broker_addr: String,
     pub version: String,
+    /// When serving a Codex session: the shared `codex app-server --listen`
+    /// endpoint, attached to registrations that carry a thread_id so the
+    /// broker can deliver via the attach engine (CX-7).
+    pub codex_app_server: Option<String>,
+    /// Token presented to the broker in session/hello ([client].auth_token).
+    pub auth_token: Option<String>,
 }
 
 pub async fn run(cfg: ShimConfig) -> anyhow::Result<()> {
@@ -72,7 +77,11 @@ pub async fn run(cfg: ShimConfig) -> anyhow::Result<()> {
             tracing::warn!("unparseable MCP line");
             continue;
         };
-        let method = v.get("method").and_then(Value::as_str).unwrap_or_default().to_string();
+        let method = v
+            .get("method")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
         let id = v.get("id").cloned().filter(|i| !i.is_null());
         let params = v.get("params").cloned().unwrap_or(Value::Null);
         match (id, method.as_str()) {
@@ -92,7 +101,9 @@ pub async fn run(cfg: ShimConfig) -> anyhow::Result<()> {
                     }),
                 );
             }
-            (Some(id), "tools/list") => mcp_respond(&mcp_tx, id, json!({ "tools": tool_definitions() })),
+            (Some(id), "tools/list") => {
+                mcp_respond(&mcp_tx, id, json!({ "tools": tool_definitions() }))
+            }
             (Some(id), "tools/call") => {
                 let broker = broker.clone();
                 let mcp_tx = mcp_tx.clone();
@@ -112,9 +123,12 @@ pub async fn run(cfg: ShimConfig) -> anyhow::Result<()> {
         }
     }
 
-    // stdin closed: the session is gone; drop everything (CL-3, no queueing).
-    drop(mcp_tx);
-    let _ = stdout_task.await;
+    // stdin closed: the session is gone (CL-3, no queueing). Exit immediately —
+    // returning tears down the process, which closes the broker TCP connection
+    // and frees the principal name for re-registration. (Awaiting the stdout
+    // task here would hang forever: the broker link holds a sender clone, so
+    // the channel never drains to closure.)
+    stdout_task.abort();
     Ok(())
 }
 
@@ -136,6 +150,7 @@ struct Call {
 struct BrokerLink {
     calls: mpsc::UnboundedSender<Call>,
     version: Arc<String>,
+    codex_app_server: Arc<Option<String>>,
 }
 
 impl BrokerLink {
@@ -146,13 +161,22 @@ impl BrokerLink {
     fn spawn(cfg: ShimConfig, mcp_tx: mpsc::UnboundedSender<Value>) -> BrokerLink {
         let (calls_tx, calls_rx) = mpsc::unbounded_channel::<Call>();
         let version = Arc::new(cfg.version.clone());
+        let codex_app_server = Arc::new(cfg.codex_app_server.clone());
         tokio::spawn(broker_loop(cfg, mcp_tx, calls_rx));
-        BrokerLink { calls: calls_tx, version }
+        BrokerLink {
+            calls: calls_tx,
+            version,
+            codex_app_server,
+        }
     }
 
     async fn call(&self, method: &str, params: Value) -> Result<Value, RpcError> {
         let (tx, rx) = oneshot::channel();
-        let call = Call { method: method.to_string(), params, resp: tx };
+        let call = Call {
+            method: method.to_string(),
+            params,
+            resp: tx,
+        };
         if self.calls.send(call).is_err() {
             return Err(unreachable_err());
         }
@@ -176,25 +200,41 @@ async fn broker_loop(
     mcp_tx: mpsc::UnboundedSender<Value>,
     mut calls_rx: mpsc::UnboundedReceiver<Call>,
 ) {
-    let mut principal: Option<String> = None;
+    // The full register params this shim carries across reconnects (name +
+    // optional codex coordinates).
+    // Backoff resets only after a connection has proven stable: a listener
+    // that accepts and immediately drops must not produce a hot reconnect
+    // loop.
+    const STABLE_CONNECTION: Duration = Duration::from_secs(5);
+    let mut binding: Option<Value> = None;
     let mut backoff = RECONNECT_MIN;
     loop {
         let stream = match TcpStream::connect(&cfg.broker_addr).await {
             Ok(s) => {
                 tracing::debug!("connected to broker at {}", cfg.broker_addr);
-                backoff = RECONNECT_MIN;
                 s
             }
             Err(e) => {
-                tracing::warn!("broker connect failed ({}): {e}; retrying in {:?}", cfg.broker_addr, backoff);
+                tracing::warn!(
+                    "broker connect failed ({}): {e}; retrying in {:?}",
+                    cfg.broker_addr,
+                    backoff
+                );
                 // While disconnected, fail tool calls immediately (never queue).
                 drain_calls_until(&mut calls_rx, backoff).await;
                 backoff = (backoff * 2).min(RECONNECT_MAX);
                 continue;
             }
         };
-        if let Err(e) = connected_loop(&cfg, stream, &mcp_tx, &mut calls_rx, &mut principal).await {
+        let connected_at = tokio::time::Instant::now();
+        if let Err(e) = connected_loop(&cfg, stream, &mcp_tx, &mut calls_rx, &mut binding).await {
             tracing::warn!("broker connection lost: {e}");
+        }
+        if connected_at.elapsed() >= STABLE_CONNECTION {
+            backoff = RECONNECT_MIN;
+        } else {
+            drain_calls_until(&mut calls_rx, backoff).await;
+            backoff = (backoff * 2).min(RECONNECT_MAX);
         }
     }
 }
@@ -216,7 +256,7 @@ async fn drain_calls_until(calls_rx: &mut mpsc::UnboundedReceiver<Call>, wait: D
 
 /// Binding side-effect to apply when a tracked call succeeds.
 enum Effect {
-    Register(String),
+    Register(Value),
     Deregister,
 }
 
@@ -230,7 +270,7 @@ async fn connected_loop(
     stream: TcpStream,
     mcp_tx: &mpsc::UnboundedSender<Value>,
     calls_rx: &mut mpsc::UnboundedReceiver<Call>,
-    principal: &mut Option<String>,
+    binding: &mut Option<Value>,
 ) -> anyhow::Result<()> {
     let (read_half, mut write_half) = stream.into_split();
     let mut lines = BufReader::new(read_half).lines();
@@ -252,16 +292,40 @@ async fn connected_loop(
             harness: Some("claude-code".into()),
             version: cfg.version.clone(),
             pid: std::process::id(),
-            cwd: std::env::current_dir().map(|p| p.display().to_string()).unwrap_or_default(),
+            cwd: std::env::current_dir()
+                .map(|p| p.display().to_string())
+                .unwrap_or_default(),
         },
+        auth_token: cfg.auth_token.clone(),
     };
     let hello_id = next_id.fetch_add(1, Ordering::Relaxed);
-    send_line!(Message::Request(request(hello_id, m::SESSION_HELLO, &hello)));
-    pending.insert(hello_id, PendingCall { resp: None, effect: None });
-    if let Some(name) = principal.clone() {
+    send_line!(Message::Request(request(
+        hello_id,
+        m::SESSION_HELLO,
+        &hello
+    )));
+    pending.insert(
+        hello_id,
+        PendingCall {
+            resp: None,
+            effect: None,
+        },
+    );
+    if let Some(params) = binding.clone() {
         let reg_id = next_id.fetch_add(1, Ordering::Relaxed);
-        send_line!(Message::Request(request(reg_id, m::PRINCIPAL_REGISTER, &RegisterParams { name: name.clone() })));
-        pending.insert(reg_id, PendingCall { resp: None, effect: Some(Effect::Register(name)) });
+        send_line!(Message::Request(protocol::Request {
+            jsonrpc: "2.0".into(),
+            id: Id::Num(reg_id),
+            method: m::PRINCIPAL_REGISTER.into(),
+            params: Some(params.clone()),
+        }));
+        pending.insert(
+            reg_id,
+            PendingCall {
+                resp: None,
+                effect: Some(Effect::Register(params)),
+            },
+        );
     }
 
     loop {
@@ -288,13 +352,13 @@ async fn connected_loop(
                         }
                     }
                     Ok(Message::Response(resp)) => {
-                        let key = match &resp.id { Id::Num(n) => *n, Id::Str(_) => continue };
+                        let key = match &resp.id { Id::Num(n) => *n, Id::Str(_) | Id::Null => continue };
                         if let Some(call) = pending.remove(&key) {
                             let result = response_to_result(resp);
                             if result.is_ok() {
                                 match call.effect {
-                                    Some(Effect::Register(name)) => *principal = Some(name),
-                                    Some(Effect::Deregister) => *principal = None,
+                                    Some(Effect::Register(params)) => *binding = Some(params),
+                                    Some(Effect::Deregister) => *binding = None,
                                     None => {}
                                 }
                             }
@@ -310,7 +374,7 @@ async fn connected_loop(
             call = calls_rx.recv() => {
                 let Some(call) = call else { anyhow::bail!("shim shutting down") };
                 let effect = if call.method == m::PRINCIPAL_REGISTER {
-                    call.params.get("name").and_then(Value::as_str).map(|n| Effect::Register(n.to_string()))
+                    Some(Effect::Register(call.params.clone()))
                 } else if call.method == m::PRINCIPAL_DEREGISTER {
                     Some(Effect::Deregister)
                 } else {
@@ -338,26 +402,14 @@ fn response_to_result(resp: Response) -> Result<Value, RpcError> {
 
 /// Translate a broker delivery into a Claude Code channel event (CL-1) and
 /// acknowledge relayed once it is on the session's stdio (CL-2).
-fn handle_deliver(
-    mcp_tx: &mpsc::UnboundedSender<Value>,
-    params: Value,
-) -> Result<Value, RpcError> {
+fn handle_deliver(mcp_tx: &mpsc::UnboundedSender<Value>, params: Value) -> Result<Value, RpcError> {
     let p: DeliverParams = serde_json::from_value(params).map_err(|e| RpcError {
         code: -32602,
         message: format!("bad deliver params: {e}"),
         data: None,
     })?;
     let e = &p.envelope;
-    let via = if e.recipients.channels.is_empty() {
-        "(direct message)".to_string()
-    } else {
-        e.recipients.channels.join(" ")
-    };
-    let content = format!(
-        "Bus message on {via} from {} (thread {}):\n\n{}\n\nTo reply, call the send tool with \
-         thread_id {} addressed to the originating channel and/or sender.",
-        e.sender, e.thread_id, e.body, e.thread_id
-    );
+    let content = protocol::render_delivery(e);
     let mut meta = serde_json::Map::new();
     meta.insert("sender".into(), json!(e.sender));
     meta.insert("thread_id".into(), json!(e.thread_id.to_string()));
@@ -371,9 +423,16 @@ fn handle_deliver(
         "params": { "content": content, "meta": Value::Object(meta) },
     });
     if mcp_tx.send(event).is_err() {
-        return Err(RpcError { code: -32000, message: "session stdio closed".into(), data: None });
+        return Err(RpcError {
+            code: -32000,
+            message: "session stdio closed".into(),
+            data: None,
+        });
     }
-    serde_json::to_value(DeliverResult { status: "relayed".into() }).map_err(|e| RpcError {
+    serde_json::to_value(DeliverResult {
+        status: "relayed".into(),
+    })
+    .map_err(|e| RpcError {
         code: -32603,
         message: e.to_string(),
         data: None,
@@ -388,9 +447,10 @@ fn tool_definitions() -> Value {
     json!([
         {
             "name": "register",
-            "description": "Register this session on the AgentWorkplace bus as a named principal (e.g. @sec-reviewer). Required before any other bus action.",
+            "description": "Register this session on the AgentWorkplace bus as a named principal (e.g. @sec-reviewer). Required before any other bus action. If you are running in Codex, first run `echo $CODEX_THREAD_ID` in your shell and pass the value as thread_id so the bus can deliver messages into this session.",
             "inputSchema": { "type": "object", "properties": {
-                "name": { "type": "string", "description": "Principal name: '@' + lowercase alphanumeric/dashes" }
+                "name": { "type": "string", "description": "Principal name: '@' + lowercase alphanumeric/dashes" },
+                "thread_id": { "type": "string", "description": "Codex only: the value of $CODEX_THREAD_ID from your shell environment" }
             }, "required": ["name"] }
         },
         {
@@ -448,10 +508,24 @@ fn tool_definitions() -> Value {
 }
 
 async fn handle_tool_call(broker: &BrokerLink, params: &Value) -> Value {
-    let name = params.get("name").and_then(Value::as_str).unwrap_or_default();
+    let name = params
+        .get("name")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
     let args = params.get("arguments").cloned().unwrap_or(json!({}));
     let result = match name {
-        "register" => broker.call(m::PRINCIPAL_REGISTER, args).await,
+        "register" => {
+            // A Codex agent self-reports its thread id (findings.md); the
+            // shim contributes the app-server endpoint from its own config.
+            let mut params = json!({ "name": args.get("name") });
+            if let (Some(thread_id), Some(app_server)) = (
+                args.get("thread_id").and_then(Value::as_str),
+                broker.codex_app_server.as_ref().as_deref(),
+            ) {
+                params["codex"] = json!({ "app_server": app_server, "thread_id": thread_id });
+            }
+            broker.call(m::PRINCIPAL_REGISTER, params).await
+        }
         "deregister" => broker.call(m::PRINCIPAL_DEREGISTER, json!({})).await,
         "send" => broker.call(m::MESSAGE_SEND, args).await,
         "subscribe" => broker.call(m::CHANNEL_SUBSCRIBE, args).await,
