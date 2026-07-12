@@ -1,0 +1,41 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/protocol",
+    "crates/broker",
+    "crates/shim-claude",
+    "crates/workplace",
+]
+
+[workspace.package]
+# The top-level VERSION file is the single authoritative version source;
+# binaries embed it via include_str!. Cargo requires this manifest field to be
+# a literal (it cannot read a file), so it must mirror VERSION — a build-time
+# guard (crates/workplace/build.rs) fails the build if the two ever drift.
+version = "0.0.0"
+edition = "2024"
+license-file = "LICENSE"
+
+[workspace.dependencies]
+protocol = { path = "crates/protocol", package = "workplace-protocol" }
+broker = { path = "crates/broker", package = "workplace-broker" }
+shim-claude = { path = "crates/shim-claude", package = "workplace-shim-claude" }
+
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "io-std", "sync", "time", "process", "signal", "fs"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rusqlite = { version = "0.40", features = ["bundled"] }
+clap = { version = "4", features = ["derive"] }
+clap_complete = "4"
+ratatui = "0.30"
+crossterm = "0.29"
+toml = "1"
+dirs = "6"
+thiserror = "2"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[profile.release]
+lto = true
+strip = true
