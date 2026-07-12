@@ -4,6 +4,8 @@ on:
   push:
     branches: [main]
   pull_request:
+    # labeled/unlabeled so toggling the skip-coverage bypass re-runs the gate.
+    types: [opened, synchronize, reopened, labeled, unlabeled]
 
 env:
   CARGO_TERM_COLOR: always
@@ -23,3 +25,33 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Tests
         run: cargo test --workspace
+
+  coverage:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # diff-cover diffs against the base branch
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+      - uses: taiki-e/install-action@cargo-llvm-cov
+      - uses: Swatinem/rust-cache@v2
+      - name: Coverage report
+        run: cargo llvm-cov --workspace --lcov --output-path lcov.info
+      - uses: actions/upload-artifact@v4
+        with:
+          name: lcov
+          path: lcov.info
+      # Patch coverage gate: changed lines in a PR need >= 80% coverage.
+      # Bypass with the `skip-coverage` label when under-coverage is justified
+      # (e.g. hard-to-exercise error paths); justify it in the PR description.
+      - name: Patch coverage (>= 80% on changed lines)
+        if: >-
+          github.event_name == 'pull_request' &&
+          !contains(github.event.pull_request.labels.*.name, 'skip-coverage')
+        run: |
+          pip install diff-cover
+          diff-cover lcov.info \
+            --compare-branch "origin/${{ github.base_ref }}" \
+            --fail-under 80
