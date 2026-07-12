@@ -4,6 +4,10 @@
 //! watch, renders the live stream in the top pane, and takes slash commands
 //! on the input line. Admin-tap deliveries are auto-acknowledged (the stream
 //! pane is fed by watch/event, not by deliveries).
+//!
+//! RPC never runs on the UI loop: every broker call is a spawned task whose
+//! output comes back through the Ui channel, so redraw and input stay live
+//! while a call is in flight.
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -15,14 +19,19 @@ use protocol::methods as m;
 use protocol::*;
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot};
 
 enum Ui {
-    Net(String),         // formatted line for the stream pane
+    Net(String), // formatted line for the stream pane
     Input(KeyEvent),
+    /// A /delete command produced a confirmation token.
+    PendingDelete {
+        channel: String,
+        token: String,
+    },
     Disconnected,
     Tick,
 }
@@ -46,12 +55,50 @@ impl Client {
         }));
         match tokio::time::timeout(std::time::Duration::from_secs(30), rx).await {
             Ok(Ok(r)) => r,
-            _ => Err(RpcError { code: -32000, message: "broker timeout".into(), data: None }),
+            out => {
+                self.pending.lock().unwrap().remove(&id);
+                let reason = match out {
+                    Err(_) => "broker timeout",
+                    _ => "broker connection lost",
+                };
+                Err(RpcError {
+                    code: -32000,
+                    message: reason.into(),
+                    data: None,
+                })
+            }
         }
     }
 }
 
-pub async fn run(addr: SocketAddr, name: String, version: String) -> anyhow::Result<()> {
+/// Raw-mode/alternate-screen guard: restores the terminal on every exit path,
+/// including error returns and unwinds.
+struct TermGuard;
+
+impl TermGuard {
+    fn enter() -> anyhow::Result<TermGuard> {
+        crossterm::terminal::enable_raw_mode()?;
+        // Construct the guard BEFORE entering the alternate screen: if that
+        // fails, the guard's drop still disables raw mode.
+        let guard = TermGuard;
+        crossterm::execute!(std::io::stdout(), crossterm::terminal::EnterAlternateScreen)?;
+        Ok(guard)
+    }
+}
+
+impl Drop for TermGuard {
+    fn drop(&mut self) {
+        let _ = crossterm::execute!(std::io::stdout(), crossterm::terminal::LeaveAlternateScreen);
+        let _ = crossterm::terminal::disable_raw_mode();
+    }
+}
+
+pub async fn run(
+    addr: SocketAddr,
+    name: String,
+    version: String,
+    auth_token: Option<String>,
+) -> anyhow::Result<()> {
     let stream = TcpStream::connect(addr).await?;
     let (read_half, mut write_half) = stream.into_split();
     let (out_tx, mut out_rx) = mpsc::unbounded_channel::<Message>();
@@ -97,13 +144,15 @@ pub async fn run(addr: SocketAddr, name: String, version: String) -> anyhow::Res
                         // Admin tap: acknowledge; display comes from watch.
                         let _ = out_tx.send(Message::Response(ok_response(
                             req.id,
-                            DeliverResult { status: "relayed".into() },
+                            DeliverResult {
+                                status: "relayed".into(),
+                            },
                         )));
                     }
                     Ok(Message::Response(resp)) => {
                         let key = match &resp.id {
                             Id::Num(n) => *n,
-                            Id::Str(_) => continue,
+                            Id::Str(_) | Id::Null => continue,
                         };
                         if let Some(tx) = client.pending.lock().unwrap().remove(&key) {
                             let _ = tx.send(match resp.error {
@@ -125,15 +174,24 @@ pub async fn run(addr: SocketAddr, name: String, version: String) -> anyhow::Res
             harness: None,
             version: version.clone(),
             pid: std::process::id(),
-            cwd: std::env::current_dir().map(|p| p.display().to_string()).unwrap_or_default(),
+            cwd: std::env::current_dir()
+                .map(|p| p.display().to_string())
+                .unwrap_or_default(),
         },
+        auth_token,
     };
-    client.call(m::SESSION_HELLO, serde_json::to_value(&hello)?).await.map_err(rpc_fail)?;
+    client
+        .call(m::SESSION_HELLO, serde_json::to_value(&hello)?)
+        .await
+        .map_err(rpc_fail)?;
     client
         .call(m::ADMIN_REGISTER, json!({ "name": name }))
         .await
         .map_err(|e| anyhow::anyhow!("admin registration as {name} failed: {}", e.message))?;
-    client.call(m::WATCH_START, json!({})).await.map_err(rpc_fail)?;
+    client
+        .call(m::WATCH_START, json!({}))
+        .await
+        .map_err(rpc_fail)?;
 
     // Input thread (blocking crossterm reads).
     {
@@ -167,20 +225,16 @@ pub async fn run(addr: SocketAddr, name: String, version: String) -> anyhow::Res
         });
     }
 
-    // Terminal.
-    crossterm::terminal::enable_raw_mode()?;
-    let mut stdout = std::io::stdout();
-    crossterm::execute!(stdout, crossterm::terminal::EnterAlternateScreen)?;
-    let mut terminal = Terminal::new(CrosstermBackend::new(stdout))?;
+    // Terminal (RAII: restored on every exit path).
+    let _term = TermGuard::enter()?;
+    let mut terminal = Terminal::new(CrosstermBackend::new(std::io::stdout()))?;
 
     let mut app = App::new(addr, name);
-    app.push(format!("connected to {addr} as admin; watching everything. /help for commands."));
+    app.push(format!(
+        "connected to {addr} as admin; watching everything. /help for commands."
+    ));
 
-    let result = event_loop(&mut terminal, &mut app, &client, &mut ui_rx).await;
-
-    crossterm::terminal::disable_raw_mode()?;
-    crossterm::execute!(std::io::stdout(), crossterm::terminal::LeaveAlternateScreen)?;
-    result
+    event_loop(&mut terminal, &mut app, &client, &ui_tx, &mut ui_rx).await
 }
 
 fn rpc_fail(e: RpcError) -> anyhow::Error {
@@ -194,6 +248,7 @@ struct App {
     input: String,
     scroll_from_bottom: u16,
     focus: Option<String>,
+    thread_focus: Option<u64>,
     pending_delete: Option<(String, String)>, // (channel, token)
     quit: bool,
 }
@@ -207,6 +262,7 @@ impl App {
             input: String::new(),
             scroll_from_bottom: 0,
             focus: None,
+            thread_focus: None,
             pending_delete: None,
             quit: false,
         }
@@ -227,15 +283,22 @@ async fn event_loop(
     terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
     app: &mut App,
     client: &Arc<Client>,
+    ui_tx: &mpsc::UnboundedSender<Ui>,
     ui_rx: &mut mpsc::UnboundedReceiver<Ui>,
 ) -> anyhow::Result<()> {
     draw(terminal, app)?;
     while let Some(ev) = ui_rx.recv().await {
         match ev {
             Ui::Net(line) => app.push(line),
+            Ui::PendingDelete { channel, token } => {
+                app.push(format!(
+                    "PERMANENT deletion of {channel} requested. Type `/confirm {channel}` within 30s to proceed."
+                ));
+                app.pending_delete = Some((channel, token));
+            }
             Ui::Disconnected => app.push("!! broker connection lost — /quit and relaunch".into()),
             Ui::Tick => {}
-            Ui::Input(key) => handle_key(app, client, key).await,
+            Ui::Input(key) => handle_key(app, client, ui_tx, key),
         }
         if app.quit {
             return Ok(());
@@ -245,13 +308,19 @@ async fn event_loop(
     Ok(())
 }
 
-async fn handle_key(app: &mut App, client: &Arc<Client>, key: KeyEvent) {
+fn handle_key(
+    app: &mut App,
+    client: &Arc<Client>,
+    ui_tx: &mpsc::UnboundedSender<Ui>,
+    key: KeyEvent,
+) {
     match key.code {
         KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => app.quit = true,
         KeyCode::Char(c) => app.input.push(c),
         KeyCode::Backspace => {
             app.input.pop();
         }
+        KeyCode::Tab => complete_command(app),
         KeyCode::PageUp => app.scroll_from_bottom = app.scroll_from_bottom.saturating_add(10),
         KeyCode::PageDown => app.scroll_from_bottom = app.scroll_from_bottom.saturating_sub(10),
         KeyCode::Enter => {
@@ -259,21 +328,85 @@ async fn handle_key(app: &mut App, client: &Arc<Client>, key: KeyEvent) {
             let line = line.trim().to_string();
             if !line.is_empty() {
                 app.scroll_from_bottom = 0;
-                run_command(app, client, &line).await;
+                run_command(app, client, ui_tx, &line);
             }
         }
         _ => {}
     }
 }
 
-async fn run_command(app: &mut App, client: &Arc<Client>, line: &str) {
+const COMMANDS: &[&str] = &[
+    "/archive",
+    "/confirm",
+    "/create",
+    "/daemon",
+    "/delete",
+    "/focus",
+    "/help",
+    "/history",
+    "/quit",
+    "/rename",
+    "/reply",
+    "/send",
+    "/shutdown",
+    "/status",
+    "/sub",
+    "/thread",
+    "/unarchive",
+    "/unsub",
+    "/who",
+];
+
+/// Tab completion for slash commands on the input line (daemon.md).
+fn complete_command(app: &mut App) {
+    if !app.input.starts_with('/') || app.input.contains(' ') {
+        return;
+    }
+    let matches: Vec<&&str> = COMMANDS
+        .iter()
+        .filter(|c| c.starts_with(&app.input))
+        .collect();
+    match matches.as_slice() {
+        [] => {}
+        [one] => {
+            app.input = format!("{one} ");
+        }
+        many => {
+            let list: Vec<&str> = many.iter().map(|c| **c).collect();
+            app.push(list.join("  "));
+        }
+    }
+}
+
+/// Spawn one broker call off the UI loop; its output lines come back through
+/// the Ui channel.
+fn spawn_rpc<F, Fut>(client: &Arc<Client>, ui_tx: &mpsc::UnboundedSender<Ui>, f: F)
+where
+    F: FnOnce(Arc<Client>, mpsc::UnboundedSender<Ui>) -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = ()> + Send,
+{
+    let client = client.clone();
+    let ui_tx = ui_tx.clone();
+    tokio::spawn(async move { f(client, ui_tx).await });
+}
+
+fn out(ui_tx: &mpsc::UnboundedSender<Ui>, line: String) {
+    let _ = ui_tx.send(Ui::Net(line));
+}
+
+fn run_command(app: &mut App, client: &Arc<Client>, ui_tx: &mpsc::UnboundedSender<Ui>, line: &str) {
     if !line.starts_with('/') {
-        // Plain text posts to the focused channel.
+        // Plain text posts to the focused channel — into the focused thread
+        // if one is set, otherwise starting a new thread.
         let Some(channel) = app.focus.clone() else {
             app.push("no focus channel: /focus #chan first, or /send <targets> <body>".into());
             return;
         };
-        send(app, client, vec![channel], vec![], line.to_string()).await;
+        let thread = app.thread_focus;
+        let body = line.to_string();
+        spawn_rpc(client, ui_tx, move |client, ui_tx| async move {
+            send(&client, &ui_tx, vec![channel], vec![], body, thread).await;
+        });
         return;
     }
     let mut parts = line.splitn(2, ' ');
@@ -296,19 +429,77 @@ async fn run_command(app: &mut App, client: &Arc<Client>, line: &str) {
                 app.push("usage: /send <#chan|@principal ...> <body>".into());
                 return;
             }
-            let channels = targets.iter().filter(|t| t.starts_with('#')).cloned().collect();
-            let principals = targets.iter().filter(|t| t.starts_with('@')).cloned().collect();
-            send(app, client, channels, principals, body).await;
+            let channels: Vec<String> = targets
+                .iter()
+                .filter(|t| t.starts_with('#'))
+                .cloned()
+                .collect();
+            let principals: Vec<String> = targets
+                .iter()
+                .filter(|t| t.starts_with('@'))
+                .cloned()
+                .collect();
+            spawn_rpc(client, ui_tx, move |client, ui_tx| async move {
+                send(&client, &ui_tx, channels, principals, body, None).await;
+            });
         }
-        "/create" => simple(app, client, m::CHANNEL_CREATE, json!({ "name": rest })).await,
+        "/reply" => {
+            // /reply <thread_id> <#chan|@principal ...> <body>
+            let mut it = rest.splitn(2, ' ');
+            let Some(tid) = it.next().and_then(|t| t.parse::<u64>().ok()) else {
+                app.push("usage: /reply <thread_id> <#chan|@principal ...> <body>".into());
+                return;
+            };
+            let (targets, body) = split_targets(it.next().unwrap_or("").trim());
+            if body.is_empty() || targets.is_empty() {
+                app.push("usage: /reply <thread_id> <#chan|@principal ...> <body>".into());
+                return;
+            }
+            let channels: Vec<String> = targets
+                .iter()
+                .filter(|t| t.starts_with('#'))
+                .cloned()
+                .collect();
+            let principals: Vec<String> = targets
+                .iter()
+                .filter(|t| t.starts_with('@'))
+                .cloned()
+                .collect();
+            spawn_rpc(client, ui_tx, move |client, ui_tx| async move {
+                send(&client, &ui_tx, channels, principals, body, Some(tid)).await;
+            });
+        }
+        "/thread" => {
+            if rest.is_empty() {
+                app.thread_focus = None;
+                app.push("thread focus cleared (plain text starts new threads)".into());
+            } else if let Ok(tid) = rest.parse::<u64>() {
+                app.thread_focus = Some(tid);
+                app.push(format!(
+                    "thread focus: {tid} (plain text now replies into it)"
+                ));
+            } else {
+                app.push("usage: /thread <thread_id>  (or /thread to clear)".into());
+            }
+        }
+        "/create" => simple(client, ui_tx, m::CHANNEL_CREATE, json!({ "name": rest })),
         "/sub" | "/unsub" => {
             let mut it = rest.split_whitespace();
             let (Some(p), Some(c)) = (it.next(), it.next()) else {
                 app.push(format!("usage: {cmd} @principal #channel"));
                 return;
             };
-            let method = if cmd == "/sub" { m::ADMIN_SUBSCRIBE } else { m::ADMIN_UNSUBSCRIBE };
-            simple(app, client, method, json!({ "principal": p, "channel": c })).await;
+            let method = if cmd == "/sub" {
+                m::ADMIN_SUBSCRIBE
+            } else {
+                m::ADMIN_UNSUBSCRIBE
+            };
+            simple(
+                client,
+                ui_tx,
+                method,
+                json!({ "principal": p, "channel": c }),
+            );
         }
         "/rename" => {
             let mut it = rest.split_whitespace();
@@ -316,59 +507,95 @@ async fn run_command(app: &mut App, client: &Arc<Client>, line: &str) {
                 app.push("usage: /rename #old #new".into());
                 return;
             };
-            simple(app, client, m::CHANNEL_RENAME, json!({ "channel": old, "new_name": new })).await;
+            simple(
+                client,
+                ui_tx,
+                m::CHANNEL_RENAME,
+                json!({ "channel": old, "new_name": new }),
+            );
         }
-        "/archive" => simple(app, client, m::CHANNEL_ARCHIVE, json!({ "channel": rest })).await,
-        "/unarchive" => simple(app, client, m::CHANNEL_UNARCHIVE, json!({ "channel": rest })).await,
-        "/delete" => match client.call(m::CHANNEL_DELETE, json!({ "channel": rest })).await {
-            Ok(v) => {
-                let token = v["confirmation_token"].as_str().unwrap_or_default().to_string();
-                app.pending_delete = Some((rest.clone(), token));
-                app.push(format!(
-                    "PERMANENT deletion of {rest} requested. Type `/confirm {rest}` within 30s to proceed."
-                ));
-            }
-            Err(e) => app.push(format!("error: {}", e.message)),
-        },
+        "/archive" => simple(
+            client,
+            ui_tx,
+            m::CHANNEL_ARCHIVE,
+            json!({ "channel": rest }),
+        ),
+        "/unarchive" => simple(
+            client,
+            ui_tx,
+            m::CHANNEL_UNARCHIVE,
+            json!({ "channel": rest }),
+        ),
+        "/delete" => {
+            spawn_rpc(client, ui_tx, move |client, ui_tx| async move {
+                match client
+                    .call(m::CHANNEL_DELETE, json!({ "channel": rest }))
+                    .await
+                {
+                    Ok(v) => {
+                        let token = v["confirmation_token"]
+                            .as_str()
+                            .unwrap_or_default()
+                            .to_string();
+                        let _ = ui_tx.send(Ui::PendingDelete {
+                            channel: rest,
+                            token,
+                        });
+                    }
+                    Err(e) => out(&ui_tx, format!("error: {}", e.message)),
+                }
+            });
+        }
         "/confirm" => {
             let Some((channel, token)) = app.pending_delete.take() else {
                 app.push("nothing pending confirmation".into());
                 return;
             };
             if rest != channel {
-                app.push(format!("confirmation aborted: typed name does not match {channel}"));
+                app.push(format!(
+                    "confirmation aborted: typed name does not match {channel}"
+                ));
                 return;
             }
             simple(
-                app,
                 client,
+                ui_tx,
                 m::CHANNEL_DELETE_CONFIRM,
                 json!({ "channel": channel, "confirmation_token": token }),
-            )
-            .await;
+            );
         }
         "/status" => match rest.parse::<u64>() {
-            Ok(id) => match client.call(m::MESSAGE_STATUS, json!({ "message_id": id })).await {
-                Ok(v) => {
-                    if let Ok(r) = serde_json::from_value::<MessageStatusResult>(v) {
-                        app.push(format!("acks for message {id}:"));
-                        for a in r.acks {
-                            app.push(format!(
-                                "  {} → {:?}{}",
-                                a.recipient,
-                                a.state,
-                                a.reason.map(|r| format!(" ({r})")).unwrap_or_default()
-                            ));
+            Ok(id) => {
+                spawn_rpc(client, ui_tx, move |client, ui_tx| async move {
+                    match client
+                        .call(m::MESSAGE_STATUS, json!({ "message_id": id }))
+                        .await
+                    {
+                        Ok(v) => {
+                            if let Ok(r) = serde_json::from_value::<MessageStatusResult>(v) {
+                                out(&ui_tx, format!("acks for message {id}:"));
+                                for a in r.acks {
+                                    out(
+                                        &ui_tx,
+                                        format!(
+                                            "  {} → {:?}{}",
+                                            a.recipient,
+                                            a.state,
+                                            a.reason.map(|r| format!(" ({r})")).unwrap_or_default()
+                                        ),
+                                    );
+                                }
+                            }
                         }
+                        Err(e) => out(&ui_tx, format!("error: {}", e.message)),
                     }
-                }
-                Err(e) => app.push(format!("error: {}", e.message)),
-            },
+                });
+            }
             Err(_) => app.push("usage: /status <message-id>".into()),
         },
         "/history" => {
             let mut it = rest.split_whitespace();
-            let Some(target) = it.next() else {
+            let Some(target) = it.next().map(String::from) else {
                 app.push("usage: /history <#channel|@principal> [limit]".into());
                 return;
             };
@@ -381,45 +608,76 @@ async fn run_command(app: &mut App, client: &Arc<Client>, line: &str) {
                 app.push("that's you".into());
                 return;
             };
-            match client.call(m::HISTORY_GET, json!({ "scope": scope, "limit": limit })).await {
-                Ok(v) => {
-                    if let Ok(r) = serde_json::from_value::<HistoryResult>(v) {
-                        app.push(format!("history {target} ({} records):", r.records.len()));
-                        for rec in r.records {
-                            app.push(format!("  {}", format_record(&rec)));
+            spawn_rpc(client, ui_tx, move |client, ui_tx| async move {
+                match client
+                    .call(m::HISTORY_GET, json!({ "scope": scope, "limit": limit }))
+                    .await
+                {
+                    Ok(v) => {
+                        if let Ok(r) = serde_json::from_value::<HistoryResult>(v) {
+                            out(
+                                &ui_tx,
+                                format!("history {target} ({} records):", r.records.len()),
+                            );
+                            for rec in r.records {
+                                out(&ui_tx, format!("  {}", format_record(&rec)));
+                            }
                         }
                     }
+                    Err(e) => out(&ui_tx, format!("error: {}", e.message)),
                 }
-                Err(e) => app.push(format!("error: {}", e.message)),
-            }
+            });
         }
-        "/who" => match client.call(m::DIRECTORY_WHO, json!({})).await {
-            Ok(v) => {
-                if let Ok(r) = serde_json::from_value::<WhoResult>(v) {
-                    for c in r.channels {
-                        app.push(format!("{}: {}", c.channel, c.subscribers.join(" ")));
+        "/who" => {
+            spawn_rpc(client, ui_tx, move |client, ui_tx| async move {
+                match client.call(m::DIRECTORY_WHO, json!({})).await {
+                    Ok(v) => {
+                        if let Ok(r) = serde_json::from_value::<WhoResult>(v) {
+                            for c in r.channels {
+                                out(
+                                    &ui_tx,
+                                    format!("{}: {}", c.channel, c.subscribers.join(" ")),
+                                );
+                            }
+                            let ps: Vec<String> = r
+                                .principals
+                                .into_iter()
+                                .map(|p| {
+                                    format!("{}{}", p.principal, if p.active { "*" } else { "" })
+                                })
+                                .collect();
+                            out(&ui_tx, format!("principals: {} (* = active)", ps.join(" ")));
+                        }
                     }
-                    let ps: Vec<String> = r
-                        .principals
-                        .into_iter()
-                        .map(|p| format!("{}{}", p.principal, if p.active { "*" } else { "" }))
-                        .collect();
-                    app.push(format!("principals: {} (* = active)", ps.join(" ")));
+                    Err(e) => out(&ui_tx, format!("error: {}", e.message)),
                 }
-            }
-            Err(e) => app.push(format!("error: {}", e.message)),
-        },
-        "/daemon" => match client.call(m::DAEMON_STATUS, json!({})).await {
-            Ok(v) => app.push(v.to_string()),
-            Err(e) => app.push(format!("error: {}", e.message)),
-        },
-        "/shutdown" => simple(app, client, m::DAEMON_SHUTDOWN, json!({})).await,
+            });
+        }
+        "/daemon" => {
+            spawn_rpc(client, ui_tx, move |client, ui_tx| async move {
+                match client.call(m::DAEMON_STATUS, json!({})).await {
+                    Ok(v) => out(&ui_tx, v.to_string()),
+                    Err(e) => out(&ui_tx, format!("error: {}", e.message)),
+                }
+            });
+        }
+        "/shutdown" => simple(client, ui_tx, m::DAEMON_SHUTDOWN, json!({})),
         other => app.push(format!("unknown command {other}; /help")),
     }
 }
 
-async fn send(app: &mut App, client: &Arc<Client>, channels: Vec<String>, principals: Vec<String>, body: String) {
-    let params = json!({ "channels": channels, "principals": principals, "body": body });
+async fn send(
+    client: &Arc<Client>,
+    ui_tx: &mpsc::UnboundedSender<Ui>,
+    channels: Vec<String>,
+    principals: Vec<String>,
+    body: String,
+    thread_id: Option<u64>,
+) {
+    let mut params = json!({ "channels": channels, "principals": principals, "body": body });
+    if let Some(tid) = thread_id {
+        params["thread_id"] = json!(tid);
+    }
     match client.call(m::MESSAGE_SEND, params).await {
         Ok(v) => {
             if let Ok(r) = serde_json::from_value::<SendResult>(v) {
@@ -436,37 +694,54 @@ async fn send(app: &mut App, client: &Arc<Client>, channels: Vec<String>, princi
                 if let Some(ea) = r.delivery.empty_audience {
                     note.push_str(&format!(" — nobody heard it ({ea:?})"));
                 }
-                app.push(note);
+                out(ui_tx, note);
             }
         }
-        Err(e) => app.push(format!("error: {}", e.message)),
+        Err(e) => out(ui_tx, format!("error: {}", e.message)),
     }
 }
 
-async fn simple(app: &mut App, client: &Arc<Client>, method: &str, params: Value) {
-    match client.call(method, params).await {
-        Ok(_) => app.push("ok".into()),
-        Err(e) => app.push(format!("error: {}", e.message)),
-    }
+fn simple(
+    client: &Arc<Client>,
+    ui_tx: &mpsc::UnboundedSender<Ui>,
+    method: &'static str,
+    params: Value,
+) {
+    spawn_rpc(client, ui_tx, move |client, ui_tx| async move {
+        match client.call(method, params).await {
+            Ok(_) => out(&ui_tx, "ok".into()),
+            Err(e) => out(&ui_tx, format!("error: {}", e.message)),
+        }
+    });
 }
 
+/// Leading `#`/`@` tokens are targets; everything after the first non-target
+/// token is the body (position-tracked, so repeated targets cannot confuse
+/// the split).
 fn split_targets(rest: &str) -> (Vec<String>, String) {
     let mut targets = Vec::new();
-    let mut body_start = 0;
-    for token in rest.split_whitespace() {
+    let mut remainder = rest;
+    loop {
+        let trimmed = remainder.trim_start();
+        let end = trimmed.find(char::is_whitespace).unwrap_or(trimmed.len());
+        let token = &trimmed[..end];
         if token.starts_with('#') || token.starts_with('@') {
             targets.push(token.to_string());
-            body_start = rest.find(token).map(|i| i + token.len()).unwrap_or(body_start);
+            remainder = &trimmed[end..];
         } else {
-            break;
+            return (targets, trimmed.to_string());
         }
     }
-    (targets, rest[body_start..].trim().to_string())
 }
 
+/// Render a UTC millisecond timestamp as local HH:MM:SS (chrono handles the
+/// platform's timezone database, Windows included).
 fn hhmmss(ms: u64) -> String {
-    let secs = (ms / 1000) % 86_400;
-    format!("{:02}:{:02}:{:02}", secs / 3600, (secs / 60) % 60, secs % 60)
+    use chrono::TimeZone;
+    match chrono::Local.timestamp_millis_opt(ms as i64) {
+        chrono::LocalResult::Single(dt) => dt.format("%H:%M:%S").to_string(),
+        _ => "??:??:??".into(),
+    }
 }
 
 fn format_event(ev: &WatchEvent) -> String {
@@ -478,7 +753,10 @@ fn format_event(ev: &WatchEvent) -> String {
             a.message_id,
             a.state,
             a.recipient,
-            a.reason.as_ref().map(|r| format!(" ({r})")).unwrap_or_default()
+            a.reason
+                .as_ref()
+                .map(|r| format!(" ({r})"))
+                .unwrap_or_default()
         ),
     }
 }
@@ -507,7 +785,9 @@ fn format_record(rec: &Record) -> String {
                 e.thread_id
             )
         }
-        Record::System { timestamp, event, .. } => {
+        Record::System {
+            timestamp, event, ..
+        } => {
             format!("{} ⚙ {}", hhmmss(*timestamp), format_system(event))
         }
     }
@@ -516,26 +796,52 @@ fn format_record(rec: &Record) -> String {
 fn format_system(e: &SystemEvent) -> String {
     match e {
         SystemEvent::Registered { principal, admin } => {
-            format!("{principal} registered{}", if *admin { " (admin)" } else { "" })
+            format!(
+                "{principal} registered{}",
+                if *admin { " (admin)" } else { "" }
+            )
         }
         SystemEvent::RegistrationDenied { name, reason } => {
             format!("registration of {name} denied: {reason}")
         }
         SystemEvent::Deregistered { principal } => format!("{principal} deregistered"),
         SystemEvent::Disconnected { principal } => format!("{principal} disconnected"),
-        SystemEvent::Subscribed { principal, channel, by_admin } => {
-            format!("{principal} subscribed to {channel}{}", if *by_admin { " (by admin)" } else { "" })
+        SystemEvent::Subscribed {
+            principal,
+            channel,
+            by_admin,
+        } => {
+            format!(
+                "{principal} subscribed to {channel}{}",
+                if *by_admin { " (by admin)" } else { "" }
+            )
         }
-        SystemEvent::Unsubscribed { principal, channel, by_admin } => {
-            format!("{principal} unsubscribed from {channel}{}", if *by_admin { " (by admin)" } else { "" })
+        SystemEvent::Unsubscribed {
+            principal,
+            channel,
+            by_admin,
+        } => {
+            format!(
+                "{principal} unsubscribed from {channel}{}",
+                if *by_admin { " (by admin)" } else { "" }
+            )
         }
         SystemEvent::ChannelCreated { channel, by } => format!("{by} created {channel}"),
-        SystemEvent::ChannelRenamed { old_name, new_name, by } => {
+        SystemEvent::ChannelRenamed {
+            old_name,
+            new_name,
+            by,
+        } => {
             format!("{by} renamed {old_name} → {new_name}")
         }
         SystemEvent::ChannelArchived { channel, by } => format!("{by} archived {channel}"),
         SystemEvent::ChannelUnarchived { channel, by } => format!("{by} unarchived {channel}"),
-        SystemEvent::ChannelDeleted { name, record_count, by, .. } => {
+        SystemEvent::ChannelDeleted {
+            name,
+            record_count,
+            by,
+            ..
+        } => {
             format!("{by} PERMANENTLY DELETED {name} ({record_count} records) — tombstone")
         }
     }
@@ -543,15 +849,17 @@ fn format_system(e: &SystemEvent) -> String {
 
 const HELP: &str = "
 commands:
-  /focus #chan            plain text posts to the focused channel
-  /send <targets> <body>  targets: #channels and/or @principals
-  /create #chan           /rename #old #new
-  /sub @p #chan           /unsub @p #chan        (admin overrides)
-  /archive #chan          /unarchive #chan
-  /delete #chan           then /confirm #chan    (PERMANENT)
-  /history <#c|@p> [n]    /status <msg-id>
-  /who                    /daemon
-  /shutdown               /quit
+  /focus #chan               plain text posts to the focused channel
+  /thread <id>               plain text replies into that thread (empty clears)
+  /send <targets> <body>     targets: #channels and/or @principals
+  /reply <tid> <targets> …   post <body> into thread <tid>
+  /create #chan              /rename #old #new
+  /sub @p #chan              /unsub @p #chan        (admin overrides)
+  /archive #chan             /unarchive #chan
+  /delete #chan              then /confirm #chan    (PERMANENT)
+  /history <#c|@p> [n]       /status <msg-id>
+  /who                       /daemon
+  /shutdown                  /quit
 ";
 
 fn draw(
@@ -568,13 +876,21 @@ fn draw(
         let total = app.lines.len();
         let bottom = total.saturating_sub(app.scroll_from_bottom as usize);
         let start = bottom.saturating_sub(height);
-        let visible: Vec<Line> =
-            app.lines[start..bottom].iter().map(|l| Line::from(l.as_str())).collect();
+        let visible: Vec<Line> = app.lines[start..bottom]
+            .iter()
+            .map(|l| Line::from(l.as_str()))
+            .collect();
         let title = format!(
-            " workplace · {} · {}{} ",
+            " workplace · {} · {}{}{} ",
             app.addr,
             app.principal,
-            app.focus.as_ref().map(|c| format!(" · focus {c}")).unwrap_or_default()
+            app.focus
+                .as_ref()
+                .map(|c| format!(" · focus {c}"))
+                .unwrap_or_default(),
+            app.thread_focus
+                .map(|t| format!(" · thread {t}"))
+                .unwrap_or_default()
         );
         f.render_widget(
             Paragraph::new(visible)
@@ -583,12 +899,18 @@ fn draw(
             chunks[0],
         );
         f.render_widget(
-            Paragraph::new(app.input.as_str())
-                .block(Block::default().borders(Borders::ALL).title(" input (/help) ")),
+            Paragraph::new(app.input.as_str()).block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(" input (/help) "),
+            ),
             chunks[1],
         );
         let cursor_x = chunks[1].x + 1 + app.input.chars().count() as u16;
-        f.set_cursor_position((cursor_x.min(chunks[1].right().saturating_sub(2)), chunks[1].y + 1));
+        f.set_cursor_position((
+            cursor_x.min(chunks[1].right().saturating_sub(2)),
+            chunks[1].y + 1,
+        ));
     })?;
     Ok(())
 }
