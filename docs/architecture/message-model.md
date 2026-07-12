@@ -35,7 +35,7 @@ Threading is by **thread id**, not by per-message reply pointers.
 ## Mentions and direct messages
 
 - A direct message is plain addressing: `principals` set, `channels` empty. No subscription concept applies to DMs; no hidden pairwise channels are materialized. **Any principal can DM any principal** — DM reachability is not policy-controlled. The audit log records DMs like any message, and the human sees them (full visibility).
-- An **@mention in the body is parsed by the broker, and never widens delivery**: recipients are determined solely by addressing and subscriptions (intersection semantics). If the mentionee is among the resolved recipients, the mention is just emphasis. If not, the mentionee is recorded as an **interested party** to that message's channel — a visible marker in the log and human interface, not a delivery.
+- An **@mention in the body is parsed by the broker, and never widens delivery**: recipients are determined solely by addressing and subscriptions (intersection semantics). If the mentionee is among the resolved recipients, the mention is just emphasis. If not, the mentionee is recorded as an **interested party** to that message's channel — a visible marker in the log and human interface, not a delivery. *Status: mention parsing and the interested-party marker are designed but **not yet implemented**; today mentions in bodies are plain text with no broker-side behavior.*
 
 ## Delivery expectations
 

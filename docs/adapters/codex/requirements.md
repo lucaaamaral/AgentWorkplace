@@ -4,14 +4,21 @@ Integration between the broker and a Codex CLI agent. Bus semantics (channels, a
 
 ## Mechanism
 
-Codex exposes its agent over the **`codex app-server`** protocol (JSON-RPC; stdio, WebSocket, unix-socket transports). Work is organized as durable **Threads** (survive restarts) containing **Turns** containing **Items**. The app-server supports multiple simultaneous clients on one thread, so the interactive TUI and the adapter attach together: the human watches natively while the adapter injects. The broker acts as an ordinary client.
+Codex exposes its agent over the **`codex app-server`** protocol (JSON-RPC; stdio, WebSocket, unix-socket transports). Work is organized as durable **Threads** (survive restarts) containing **Turns** containing **Items**. A plain `codex` session runs its engine in-process with **no reachable endpoint** (verified: no listener, no socket, no child server) — push into it is impossible, exactly as a plain `claude` session is closed without the channels flag. The one interactive attach point is the **`codex --remote <addr>`** flag, which runs the interactive TUI against a shared `codex app-server --listen <addr>`; multiple clients share that server, so the human watches natively while the adapter injects. The broker acts as an ordinary client.
+
+The shared app-server is **spawned and supervised by `workplace daemon`** (config `[codex] app_server`, see [daemon runtime](../../architecture/daemon.md)) — the human never runs it. Per-session opt-in is one launch flag, symmetric with Claude:
 
 ```
-Codex TUI ──┐
-            ├── codex app-server (ws://127.0.0.1:<port>) ── thread <id>
-broker ─────┘
-  (adapter = WebSocket client; delivers via turn/start)
+codex --remote ws://127.0.0.1:9701          # the human's interactive window
+                 │
+                 ├── codex app-server --listen ws://127.0.0.1:9701
+                 │        (managed child of workplace daemon)
+broker ──────────┘
+  (adapter = second WebSocket client; delivers via turn/start on the
+   human-owned thread; processed observed by polling thread/read)
 ```
+
+Without the flag, a plain `codex` session still participates **outbound-only** through the bus MCP entry (register, send, subscribe, history on request); deliveries to it fail visibly in ack state.
 
 Protocol operations the adapter relies on:
 
@@ -43,10 +50,10 @@ Protocol operations the adapter relies on:
 
 States and presence semantics: [common contract](../session-lifecycle.md) · [Codex specifics](session-lifecycle.md).
 
-- CX-7. The human starts the Codex environment normally, attached to an app-server (one-time setup provides the config/alias); no wrapper. On in-session registration, the call must carry enough to identify the session (thread id, or metadata resolved via `thread/list`); the adapter records `(principal, app-server endpoint, thread id)` and attaches as a client for delivery.
+- CX-7. The human starts the Codex environment with one flag (`codex --remote <addr>`, alias-able; one-time setup provides config and alias); no wrapper. On in-session registration the **agent self-reports its thread id** by reading `$CODEX_THREAD_ID` from its own shell environment (the register tool instructs this; `thread/list` is connection-scoped and cannot discover it — [findings](findings.md)); the bus MCP entry contributes the app-server endpoint from its configuration. The adapter records `(principal, app-server endpoint, thread id)` and attaches as a client for delivery.
 - CX-8. Threads unload after ~30 idle minutes with no subscribers (`thread/closed` notification). This is normal, not an error; the adapter must `thread/resume` transparently on next delivery — history is preserved.
 - CX-9. On broker restart, the adapter re-attaches to running app-servers from persisted state; `thread/read` reconciles missed events.
-- CX-10. Thread id is the session identity. The adapter forwards liveness (loaded/unloaded, turn in progress, token usage from `turn/completed`) for display in the human interface.
+- CX-10. Thread id is the session identity. The adapter forwards liveness (loaded/unloaded, turn in progress, token usage from `turn/completed`) for display in the human interface. *Status: not yet implemented — the attach client is a non-owner and does not receive owner-routed events; liveness display needs a polling design first.*
 - CX-11. Approvals are notify-only ([ADR-0012](../../decision-records/0012-approvals-are-notify-only.md)): approval requests (`item/commandExecution/requestApproval`, `item/fileChange/requestApproval`) are answered by the human's attached TUI. The adapter must never answer or forward them; it may surface "approval pending" as a notification to the human.
 
 ## Harness facts and constraints
@@ -55,7 +62,7 @@ States and presence semantics: [common contract](../session-lifecycle.md) · [Co
 | --- | --- |
 | Codex CLI version | Needs app-server WebSocket transport, multi-client mode, and TUI attach (March 2026 releases onward); pin and verify |
 | Transport | WebSocket (or unix socket on POSIX) required for multi-client (TUI + adapter); stdio is single-client. On Windows, loopback WebSocket is the multi-client transport |
-| Auth | Bearer/capability token supported and should be set even for loopback (any local process could otherwise drive the agent) |
+| Auth | Capability token via `codex app-server --ws-auth capability-token --ws-token-file <path>` (verified on 0.144.1); clients present `Authorization: Bearer <token>` on the WebSocket upgrade, the interactive window via `codex --remote <addr> --remote-auth-token-env <VAR>`. Should be set even for loopback (any local process could otherwise drive the agent) — `[codex] token_file` in the daemon config wires all three sides |
 | Turn semantics | `turn/start` during an active turn: confirm protocol behavior (rejected vs queued) — drives CX-2 |
 | Thread unload | 30-minute idle unload is server policy (drives CX-8) |
 
@@ -64,8 +71,8 @@ See also: [spike findings](findings.md).
 ## Risks / open questions
 
 - **TUI + injected turns UX.** The TUI renders turns the adapter started. Verify the human can distinguish bus-initiated turns from their own prompts (delivery formatting should make the source explicit). Not yet tested — the spike used single-client stdio, not a WebSocket TUI sharing the thread.
-- **`turn/steer` usefulness.** Confirmed to work (requires `expectedTurnId`; appends guidance to the active turn rather than interrupting — [findings](findings.md)). Deliveries still wait for idle (CX-2); evaluate later whether any delivery class justifies steering into a running turn.
-- **Delivery-path discovery at registration.** The initiative is the harness's: registration arrives through the session's bus MCP entry, and must carry the delivery path the adapter records — app-server endpoint and thread id (CX-7). How the MCP entry learns them (endpoint from the one-time setup config it is launched with; thread id via `thread/list` metadata matching) is an implementation/spike detail. One app-server per agent vs one shared app-server with many threads is a deployment choice the adapter is agnostic to — it dials whatever registration reports.
+- **`turn/steer` not adopted for delivery (settled).** Edge-case testing ([findings](findings.md)) showed steering an unrelated message into a running turn blends it into the agent's current work (no clean thread/attribution), and steering races turn completion. Delivery therefore stays `turn/start` serialized on idle (CX-2); `turn/steer` is reserved for a possible future override/interrupt class where derailing the current turn is the intent.
+- **Delivery-path discovery at registration (settled).** The initiative is the harness's: registration arrives through the session's bus MCP entry, and must carry the delivery path the adapter records — app-server endpoint and thread id (CX-7). The MCP entry contributes the endpoint from the config it is launched with; the thread id is self-reported by the agent from `$CODEX_THREAD_ID` ([findings](findings.md) — `thread/list` is connection-scoped and cannot discover it). One app-server per agent vs one shared app-server with many threads is a deployment choice the adapter is agnostic to — it dials whatever registration reports, **constrained to loopback `ws://` endpoints** (the value arrives over the wire; a non-loopback URL is rejected at registration).
 
 ## References
 
