@@ -4,6 +4,7 @@ members = [
     "crates/protocol",
     "crates/broker",
     "crates/shim-claude",
+    "crates/adapter-codex",
     "crates/workplace",
 ]
 
@@ -20,6 +21,7 @@ license-file = "LICENSE"
 protocol = { path = "crates/protocol", package = "workplace-protocol" }
 broker = { path = "crates/broker", package = "workplace-broker" }
 shim-claude = { path = "crates/shim-claude", package = "workplace-shim-claude" }
+adapter-codex = { path = "crates/adapter-codex", package = "workplace-adapter-codex" }
 
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "io-std", "sync", "time", "process", "signal", "fs"] }
 serde = { version = "1", features = ["derive"] }
@@ -33,6 +35,8 @@ toml = "1"
 dirs = "6"
 thiserror = "2"
 anyhow = "1"
+tokio-tungstenite = "0.30"
+futures-util = "0.3"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 

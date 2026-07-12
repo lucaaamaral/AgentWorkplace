@@ -1,0 +1,21 @@
+[package]
+name = "workplace-adapter-codex"
+version.workspace = true
+edition.workspace = true
+license-file.workspace = true
+
+[lib]
+name = "adapter_codex"
+path = "src/lib.rs"
+
+[dependencies]
+protocol.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tokio-tungstenite.workspace = true
+futures-util.workspace = true
+
+[dev-dependencies]
