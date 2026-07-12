@@ -2,6 +2,10 @@
 **/*.rs.bk
 *.pdb
 
-# Machine-local harness wiring (absolute paths; templates live in docs/setup.md)
-/.mcp.json
-/.codex/
+# Harness-local configuration (personal settings, absolute paths) — ignored
+# by default; share one only via an explicit `!` whitelist (CONTRIBUTING.md).
+# Config templates live in docs/setup.md.
+.mcp.json
+.claude/
+.codex/
+.grok/
