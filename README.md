@@ -4,7 +4,7 @@ A local, push-based pub-sub message bus that lets multiple coding agents (Claude
 
 Each agent keeps its own long-lived session and specialized context. Agents consult each other proactively by publishing to channels; the human monitors every exchange, participates on any channel, and course-corrects when a conversation drifts.
 
-**Status: design phase.** The architecture and adapter requirements are documented; no implementation exists yet. The implementation language is Rust ([ADR-0013](docs/decision-records/0013-rust-implementation-language.md)), targeting macOS, Linux, and Windows. The shipped commands are `workplace daemon` (broker) and `workplace cli` (human interface). Versioning is semantic; the version number lives in [`VERSION`](VERSION) — the single authoritative source, read by anything that needs a version number. Licensed under the [AgentWorkplace License](LICENSE), which requires acknowledgement in any project that incorporates or derives from this work; the repository is private for now.
+**Status: implemented, pre-release.** The broker daemon, TUI, Claude Code shim, and Codex adapter are implemented in Rust ([ADR-0013](docs/decision-records/0013-rust-implementation-language.md)), targeting macOS, Linux, and Windows; integration tests cover the RPC surface, delivery acks, Codex routing, and restart semantics. The shipped commands are `workplace daemon` (broker) and `workplace cli` (human interface). Versioning is semantic; the version number lives in [`VERSION`](VERSION) — the single authoritative source, read by anything that needs a version number. Licensed under the [AgentWorkplace License](LICENSE), which requires acknowledgement in any project that incorporates or derives from this work; the repository is private for now.
 
 ## Why this exists
 
@@ -21,18 +21,19 @@ Instead, AgentWorkplace uses each harness's native push mechanism to deliver mes
 
 All traffic transits a single local broker with an append-only store, so the full inter-agent conversation is auditable independently of any agent's context window.
 
-See [docs/architecture/overview.md](docs/architecture/overview.md) for the design and [docs/decision-records/](docs/decision-records/README.md) for the numbered ADRs recording the rationale behind each choice.
+See [docs/setup.md](docs/setup.md) to get running, [docs/architecture/overview.md](docs/architecture/overview.md) for the design, and [docs/decision-records/](docs/decision-records/README.md) for the numbered ADRs recording the rationale behind each choice.
 
-## Quick setup (aspirational)
+## Quick start
 
-> Placeholder — this is the intended flow once implemented; nothing exists yet.
+Full walkthrough with per-harness wiring, auth, and troubleshooting: **[docs/setup.md](docs/setup.md)**. The short version:
 
-1. Start the broker: `workplace daemon` — or skip this; any `workplace cli` invocation lazy-starts it. Optionally enable tab completion: `workplace completions` (detects your shell).
-2. Create a channel per domain: `#security`, `#business`, `#performance`, `#general`.
-3. One-time per machine, enable the bus pathway in each harness: the shim for Claude Code (loaded through Claude Code's own channels mechanism at launch) and, for Codex, app-server attachment plus the bus MCP entry in its config.
-4. Launch your environments normally, one per desktop/window: `claude` for the security and business work, `codex` for the performance work.
-5. From inside each session, register it on the bus — prompt the agent: *"register this session as sec-reviewer and subscribe to #security and #general"*. The agent calls the bus registration/subscription tools; the human can force or cancel subscriptions later.
-6. Join as manager: `workplace cli` — an interactive TUI: live view of every channel and DM, with a command line to post, administer, and inspect from the same window. (Web interface deferred.)
+1. **Install** (Rust stable required): `cargo install --path crates/workplace` — one binary, `workplace`.
+2. **Start as manager**: `workplace cli` — lazy-starts the broker daemon, opens the TUI. Create channels: `/create #general`, `/create #security`, …
+3. **Wire Claude Code** (once per machine): `claude mcp add --scope user workplace -- ~/.cargo/bin/workplace shim-claude --broker 127.0.0.1:9675`
+4. **Wire Codex** (once per machine): add the same shim to the global `~/.codex/config.toml` `[mcp_servers]` (with `--codex-app-server ws://127.0.0.1:9701`), set `[codex] app_server = "ws://127.0.0.1:9701"` in `~/.config/workplace/config.toml`, and launch sessions with `codex --remote ws://127.0.0.1:9701` for push delivery.
+5. **Register each session from inside it** — prompt the agent: *"register this session as @sec-reviewer and subscribe to #security and #general"*. Verify with `/who` in the TUI.
+
+Every message, subscription change, and delivery ack streams live into the TUI and persists in the append-only store.
 
 ## Use cases
 

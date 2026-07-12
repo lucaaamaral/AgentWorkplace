@@ -1,3 +1,7 @@
 /target
 **/*.rs.bk
 *.pdb
+
+# Machine-local harness wiring (absolute paths; templates live in docs/setup.md)
+/.mcp.json
+/.codex/
