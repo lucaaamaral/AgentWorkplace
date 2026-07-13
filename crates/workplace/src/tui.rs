@@ -1039,6 +1039,47 @@ mod tests {
     }
 
     #[test]
+    fn push_caps_the_buffer_and_splits_lines() {
+        let addr: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let mut app = App::new(addr, "@m".into());
+        app.push("one\ntwo".into());
+        assert_eq!(app.lines, vec!["one".to_string(), "two".to_string()]);
+
+        for i in 0..6000 {
+            app.push(format!("l{i}"));
+        }
+        assert_eq!(app.lines.len(), 5000, "buffer must cap at 5000 lines");
+        assert_eq!(app.lines.last().unwrap(), "l5999", "newest lines are kept");
+    }
+
+    fn dummy_client() -> Arc<Client> {
+        Arc::new(Client {
+            out: mpsc::unbounded_channel().0,
+            next_id: AtomicU64::new(1),
+            pending: Mutex::new(HashMap::new()),
+        })
+    }
+
+    #[tokio::test]
+    async fn scroll_keys_saturate() {
+        let addr: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let (ui_tx, _ui_rx) = mpsc::unbounded_channel();
+        let client = dummy_client();
+        let mut app = App::new(addr, "@m".into());
+
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        handle_key(&mut app, &client, &ui_tx, key(KeyCode::PageDown));
+        assert_eq!(
+            app.scroll_from_bottom, 0,
+            "PageDown at the tail saturates at 0"
+        );
+        handle_key(&mut app, &client, &ui_tx, key(KeyCode::PageUp));
+        assert_eq!(app.scroll_from_bottom, 10);
+        handle_key(&mut app, &client, &ui_tx, key(KeyCode::PageDown));
+        assert_eq!(app.scroll_from_bottom, 0);
+    }
+
+    #[test]
     fn command_completion() {
         let addr: SocketAddr = "127.0.0.1:1".parse().unwrap();
 
