@@ -8,22 +8,20 @@
 //! first, an unreachable app-server holds the delivery while the session is
 //! present, and approval requests are never answered by the adapter.
 
-use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering as AtOrd};
 use std::time::Duration;
 
-use broker::{Broker, BrokerConfig, server};
+use broker::{Broker, BrokerConfig};
 use futures_util::{SinkExt, StreamExt};
 use protocol::methods as m;
 use protocol::*;
 use serde_json::{Value, json};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::TcpListener;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 
-const T: Duration = Duration::from_secs(10);
+mod common;
+use common::{Client, start_broker as start_broker_with_config};
 
 /// Knobs for the fake `codex app-server --listen`.
 #[derive(Clone, Default)]
@@ -317,71 +315,7 @@ async fn fake_app_server(behavior: FakeBehavior) -> (String, Arc<FakeStats>) {
     (format!("ws://{addr}"), stats)
 }
 
-struct Client {
-    reader: tokio::io::Lines<BufReader<OwnedReadHalf>>,
-    writer: OwnedWriteHalf,
-    next_id: u64,
-    queue: VecDeque<Message>,
-}
-
 impl Client {
-    async fn connect_hello(addr: std::net::SocketAddr) -> Client {
-        let stream = TcpStream::connect(addr).await.unwrap();
-        let (r, w) = stream.into_split();
-        let mut c = Client {
-            reader: BufReader::new(r).lines(),
-            writer: w,
-            next_id: 1,
-            queue: VecDeque::new(),
-        };
-        c.call(
-            m::SESSION_HELLO,
-            json!({ "client_info": { "version": "t", "pid": 1, "cwd": "/" } }),
-        )
-        .await
-        .unwrap();
-        c
-    }
-
-    async fn read_socket(&mut self) -> Message {
-        loop {
-            let line = tokio::time::timeout(T, self.reader.next_line())
-                .await
-                .expect("read timeout")
-                .unwrap()
-                .expect("connection closed");
-            if line.trim().is_empty() {
-                continue;
-            }
-            return Message::parse(&line).unwrap();
-        }
-    }
-
-    async fn call(&mut self, method: &str, params: Value) -> Result<Value, RpcError> {
-        let id = self.next_id;
-        self.next_id += 1;
-        let mut line = Message::Request(Request {
-            jsonrpc: "2.0".into(),
-            id: Id::Num(id),
-            method: method.into(),
-            params: Some(params),
-        })
-        .to_line();
-        line.push('\n');
-        self.writer.write_all(line.as_bytes()).await.unwrap();
-        loop {
-            match self.read_socket().await {
-                Message::Response(resp) if resp.id == Id::Num(id) => {
-                    return match resp.error {
-                        Some(e) => Err(e),
-                        None => Ok(resp.result.unwrap_or(Value::Null)),
-                    };
-                }
-                other => self.queue.push_back(other),
-            }
-        }
-    }
-
     /// Assert no message/deliver request arrives on this connection within a
     /// short window (codex-registered sessions are delivered via attach).
     async fn assert_no_deliver(&mut self, window: Duration) {
@@ -424,9 +358,7 @@ async fn start_broker() -> (std::net::SocketAddr, Broker) {
 async fn start_broker_with_token(
     codex_token_file: Option<std::path::PathBuf>,
 ) -> (std::net::SocketAddr, Broker) {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let broker = Broker::new(BrokerConfig {
+    start_broker_with_config(BrokerConfig {
         listens: vec![],
         db_path: None,
         message_size_limit: 1024,
@@ -437,9 +369,7 @@ async fn start_broker_with_token(
         max_out_queue: 8192,
         admin_token: Some("test-admin".into()),
     })
-    .unwrap();
-    tokio::spawn(server::serve_listener(broker.clone(), listener));
-    (addr, broker)
+    .await
 }
 
 /// Register a codex-coordinates principal, DM it, and return (sender's send
