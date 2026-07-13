@@ -9,9 +9,7 @@ name = "adapter_codex"
 path = "src/lib.rs"
 
 [dependencies]
-protocol.workspace = true
 tokio.workspace = true
-serde.workspace = true
 serde_json.workspace = true
 anyhow.workspace = true
 tracing.workspace = true

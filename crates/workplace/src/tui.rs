@@ -395,102 +395,256 @@ fn out(ui_tx: &mpsc::UnboundedSender<Ui>, line: String) {
     let _ = ui_tx.send(Ui::Net(line));
 }
 
-fn run_command(app: &mut App, client: &Arc<Client>, ui_tx: &mpsc::UnboundedSender<Ui>, line: &str) {
+/// A parsed input line: what the operator asked for, independent of app
+/// state, the client, and the terminal (R2 — the pure half of command
+/// handling; effects stay in run_command).
+#[derive(Debug, Clone, PartialEq)]
+enum Command {
+    /// Non-slash input: post to the focused channel.
+    Post {
+        body: String,
+    },
+    Help,
+    Quit,
+    Focus {
+        channel: String,
+    },
+    Send {
+        channels: Vec<String>,
+        principals: Vec<String>,
+        body: String,
+    },
+    Reply {
+        thread_id: u64,
+        channels: Vec<String>,
+        principals: Vec<String>,
+        body: String,
+    },
+    ThreadFocus {
+        thread_id: Option<u64>,
+    },
+    Create {
+        name: String,
+    },
+    AdminSubscription {
+        subscribe: bool,
+        principal: String,
+        channel: String,
+    },
+    Rename {
+        old: String,
+        new: String,
+    },
+    Archive {
+        channel: String,
+        archive: bool,
+    },
+    Delete {
+        channel: String,
+    },
+    Confirm {
+        channel: String,
+    },
+    Status {
+        message_id: u64,
+    },
+    History {
+        target: String,
+        limit: u32,
+    },
+    Who,
+    Daemon,
+    Shutdown,
+    Usage(&'static str),
+    Unknown(String),
+}
+
+fn parse_command(line: &str) -> Command {
     if !line.starts_with('/') {
-        // Plain text posts to the focused channel — into the focused thread
-        // if one is set, otherwise starting a new thread.
-        let Some(channel) = app.focus.clone() else {
-            app.push("no focus channel: /focus #chan first, or /send <targets> <body>".into());
-            return;
+        return Command::Post {
+            body: line.to_string(),
         };
-        let thread = app.thread_focus;
-        let body = line.to_string();
-        spawn_rpc(client, ui_tx, move |client, ui_tx| async move {
-            send(&client, &ui_tx, vec![channel], vec![], body, thread).await;
-        });
-        return;
     }
     let mut parts = line.splitn(2, ' ');
     let cmd = parts.next().unwrap_or_default();
     let rest = parts.next().unwrap_or("").trim().to_string();
     match cmd {
-        "/help" => app.push(HELP.trim().to_string()),
-        "/quit" => app.quit = true,
+        "/help" => Command::Help,
+        "/quit" => Command::Quit,
         "/focus" => {
             if rest.starts_with('#') {
-                app.focus = Some(rest.clone());
-                app.push(format!("focus: {rest} (plain text now posts there)"));
+                Command::Focus { channel: rest }
             } else {
-                app.push("usage: /focus #channel".into());
+                Command::Usage("usage: /focus #channel")
             }
         }
         "/send" => {
             let (targets, body) = split_targets(&rest);
             if body.is_empty() || targets.is_empty() {
-                app.push("usage: /send <#chan|@principal ...> <body>".into());
-                return;
+                return Command::Usage("usage: /send <#chan|@principal ...> <body>");
             }
-            let channels: Vec<String> = targets
-                .iter()
-                .filter(|t| t.starts_with('#'))
-                .cloned()
-                .collect();
-            let principals: Vec<String> = targets
-                .iter()
-                .filter(|t| t.starts_with('@'))
-                .cloned()
-                .collect();
+            let (channels, principals) = partition_targets(&targets);
+            Command::Send {
+                channels,
+                principals,
+                body,
+            }
+        }
+        "/reply" => {
+            let mut it = rest.splitn(2, ' ');
+            let Some(thread_id) = it.next().and_then(|t| t.parse::<u64>().ok()) else {
+                return Command::Usage("usage: /reply <thread_id> <#chan|@principal ...> <body>");
+            };
+            let (targets, body) = split_targets(it.next().unwrap_or("").trim());
+            if body.is_empty() || targets.is_empty() {
+                return Command::Usage("usage: /reply <thread_id> <#chan|@principal ...> <body>");
+            }
+            let (channels, principals) = partition_targets(&targets);
+            Command::Reply {
+                thread_id,
+                channels,
+                principals,
+                body,
+            }
+        }
+        "/thread" => {
+            if rest.is_empty() {
+                Command::ThreadFocus { thread_id: None }
+            } else if let Ok(thread_id) = rest.parse::<u64>() {
+                Command::ThreadFocus {
+                    thread_id: Some(thread_id),
+                }
+            } else {
+                Command::Usage("usage: /thread <thread_id>  (or /thread to clear)")
+            }
+        }
+        "/create" => Command::Create { name: rest },
+        "/sub" | "/unsub" => {
+            let mut it = rest.split_whitespace();
+            let (Some(principal), Some(channel)) = (it.next(), it.next()) else {
+                return Command::Usage(if cmd == "/sub" {
+                    "usage: /sub @principal #channel"
+                } else {
+                    "usage: /unsub @principal #channel"
+                });
+            };
+            Command::AdminSubscription {
+                subscribe: cmd == "/sub",
+                principal: principal.to_string(),
+                channel: channel.to_string(),
+            }
+        }
+        "/rename" => {
+            let mut it = rest.split_whitespace();
+            let (Some(old), Some(new)) = (it.next(), it.next()) else {
+                return Command::Usage("usage: /rename #old #new");
+            };
+            Command::Rename {
+                old: old.to_string(),
+                new: new.to_string(),
+            }
+        }
+        "/archive" => Command::Archive {
+            channel: rest,
+            archive: true,
+        },
+        "/unarchive" => Command::Archive {
+            channel: rest,
+            archive: false,
+        },
+        "/delete" => Command::Delete { channel: rest },
+        "/confirm" => Command::Confirm { channel: rest },
+        "/status" => match rest.parse::<u64>() {
+            Ok(message_id) => Command::Status { message_id },
+            Err(_) => Command::Usage("usage: /status <message-id>"),
+        },
+        "/history" => {
+            let mut it = rest.split_whitespace();
+            let Some(target) = it.next().map(String::from) else {
+                return Command::Usage("usage: /history <#channel|@principal> [limit]");
+            };
+            let limit = it.next().and_then(|v| v.parse::<u32>().ok()).unwrap_or(20);
+            Command::History { target, limit }
+        }
+        "/who" => Command::Who,
+        "/daemon" => Command::Daemon,
+        "/shutdown" => Command::Shutdown,
+        other => Command::Unknown(other.to_string()),
+    }
+}
+
+fn partition_targets(targets: &[String]) -> (Vec<String>, Vec<String>) {
+    (
+        targets
+            .iter()
+            .filter(|t| t.starts_with('#'))
+            .cloned()
+            .collect(),
+        targets
+            .iter()
+            .filter(|t| t.starts_with('@'))
+            .cloned()
+            .collect(),
+    )
+}
+
+fn run_command(app: &mut App, client: &Arc<Client>, ui_tx: &mpsc::UnboundedSender<Ui>, line: &str) {
+    match parse_command(line) {
+        Command::Post { body } => {
+            // Plain text posts to the focused channel — into the focused
+            // thread if one is set, otherwise starting a new thread.
+            let Some(channel) = app.focus.clone() else {
+                app.push("no focus channel: /focus #chan first, or /send <targets> <body>".into());
+                return;
+            };
+            let thread = app.thread_focus;
+            spawn_rpc(client, ui_tx, move |client, ui_tx| async move {
+                send(&client, &ui_tx, vec![channel], vec![], body, thread).await;
+            });
+        }
+        Command::Help => app.push(HELP.trim().to_string()),
+        Command::Quit => app.quit = true,
+        Command::Focus { channel } => {
+            app.push(format!("focus: {channel} (plain text now posts there)"));
+            app.focus = Some(channel);
+        }
+        Command::Send {
+            channels,
+            principals,
+            body,
+        } => {
             spawn_rpc(client, ui_tx, move |client, ui_tx| async move {
                 send(&client, &ui_tx, channels, principals, body, None).await;
             });
         }
-        "/reply" => {
-            // /reply <thread_id> <#chan|@principal ...> <body>
-            let mut it = rest.splitn(2, ' ');
-            let Some(tid) = it.next().and_then(|t| t.parse::<u64>().ok()) else {
-                app.push("usage: /reply <thread_id> <#chan|@principal ...> <body>".into());
-                return;
-            };
-            let (targets, body) = split_targets(it.next().unwrap_or("").trim());
-            if body.is_empty() || targets.is_empty() {
-                app.push("usage: /reply <thread_id> <#chan|@principal ...> <body>".into());
-                return;
-            }
-            let channels: Vec<String> = targets
-                .iter()
-                .filter(|t| t.starts_with('#'))
-                .cloned()
-                .collect();
-            let principals: Vec<String> = targets
-                .iter()
-                .filter(|t| t.starts_with('@'))
-                .cloned()
-                .collect();
+        Command::Reply {
+            thread_id,
+            channels,
+            principals,
+            body,
+        } => {
             spawn_rpc(client, ui_tx, move |client, ui_tx| async move {
-                send(&client, &ui_tx, channels, principals, body, Some(tid)).await;
+                send(&client, &ui_tx, channels, principals, body, Some(thread_id)).await;
             });
         }
-        "/thread" => {
-            if rest.is_empty() {
-                app.thread_focus = None;
-                app.push("thread focus cleared (plain text starts new threads)".into());
-            } else if let Ok(tid) = rest.parse::<u64>() {
-                app.thread_focus = Some(tid);
-                app.push(format!(
-                    "thread focus: {tid} (plain text now replies into it)"
-                ));
-            } else {
-                app.push("usage: /thread <thread_id>  (or /thread to clear)".into());
+        Command::ThreadFocus { thread_id } => {
+            app.thread_focus = thread_id;
+            match thread_id {
+                Some(t) => app.push(format!(
+                    "thread focus: {t} (plain text now replies into it)"
+                )),
+                None => app.push("thread focus cleared (plain text starts new threads)".into()),
             }
         }
-        "/create" => simple(client, ui_tx, m::CHANNEL_CREATE, json!({ "name": rest })),
-        "/sub" | "/unsub" => {
-            let mut it = rest.split_whitespace();
-            let (Some(p), Some(c)) = (it.next(), it.next()) else {
-                app.push(format!("usage: {cmd} @principal #channel"));
-                return;
-            };
-            let method = if cmd == "/sub" {
+        Command::Create { name } => {
+            simple(client, ui_tx, m::CHANNEL_CREATE, json!({ "name": name }))
+        }
+        Command::AdminSubscription {
+            subscribe,
+            principal,
+            channel,
+        } => {
+            let method = if subscribe {
                 m::ADMIN_SUBSCRIBE
             } else {
                 m::ADMIN_UNSUBSCRIBE
@@ -499,15 +653,10 @@ fn run_command(app: &mut App, client: &Arc<Client>, ui_tx: &mpsc::UnboundedSende
                 client,
                 ui_tx,
                 method,
-                json!({ "principal": p, "channel": c }),
+                json!({ "principal": principal, "channel": channel }),
             );
         }
-        "/rename" => {
-            let mut it = rest.split_whitespace();
-            let (Some(old), Some(new)) = (it.next(), it.next()) else {
-                app.push("usage: /rename #old #new".into());
-                return;
-            };
+        Command::Rename { old, new } => {
             simple(
                 client,
                 ui_tx,
@@ -515,22 +664,18 @@ fn run_command(app: &mut App, client: &Arc<Client>, ui_tx: &mpsc::UnboundedSende
                 json!({ "channel": old, "new_name": new }),
             );
         }
-        "/archive" => simple(
-            client,
-            ui_tx,
-            m::CHANNEL_ARCHIVE,
-            json!({ "channel": rest }),
-        ),
-        "/unarchive" => simple(
-            client,
-            ui_tx,
-            m::CHANNEL_UNARCHIVE,
-            json!({ "channel": rest }),
-        ),
-        "/delete" => {
+        Command::Archive { channel, archive } => {
+            let method = if archive {
+                m::CHANNEL_ARCHIVE
+            } else {
+                m::CHANNEL_UNARCHIVE
+            };
+            simple(client, ui_tx, method, json!({ "channel": channel }));
+        }
+        Command::Delete { channel } => {
             spawn_rpc(client, ui_tx, move |client, ui_tx| async move {
                 match client
-                    .call(m::CHANNEL_DELETE, json!({ "channel": rest }))
+                    .call(m::CHANNEL_DELETE, json!({ "channel": channel }))
                     .await
                 {
                     Ok(v) => {
@@ -538,21 +683,18 @@ fn run_command(app: &mut App, client: &Arc<Client>, ui_tx: &mpsc::UnboundedSende
                             .as_str()
                             .unwrap_or_default()
                             .to_string();
-                        let _ = ui_tx.send(Ui::PendingDelete {
-                            channel: rest,
-                            token,
-                        });
+                        let _ = ui_tx.send(Ui::PendingDelete { channel, token });
                     }
                     Err(e) => out(&ui_tx, format!("error: {}", e.message)),
                 }
             });
         }
-        "/confirm" => {
+        Command::Confirm { channel: typed } => {
             let Some((channel, token)) = app.pending_delete.take() else {
                 app.push("nothing pending confirmation".into());
                 return;
             };
-            if rest != channel {
+            if typed != channel {
                 app.push(format!(
                     "confirmation aborted: typed name does not match {channel}"
                 ));
@@ -565,42 +707,33 @@ fn run_command(app: &mut App, client: &Arc<Client>, ui_tx: &mpsc::UnboundedSende
                 json!({ "channel": channel, "confirmation_token": token }),
             );
         }
-        "/status" => match rest.parse::<u64>() {
-            Ok(id) => {
-                spawn_rpc(client, ui_tx, move |client, ui_tx| async move {
-                    match client
-                        .call(m::MESSAGE_STATUS, json!({ "message_id": id }))
-                        .await
-                    {
-                        Ok(v) => {
-                            if let Ok(r) = serde_json::from_value::<MessageStatusResult>(v) {
-                                out(&ui_tx, format!("acks for message {id}:"));
-                                for a in r.acks {
-                                    out(
-                                        &ui_tx,
-                                        format!(
-                                            "  {} → {:?}{}",
-                                            a.recipient,
-                                            a.state,
-                                            a.reason.map(|r| format!(" ({r})")).unwrap_or_default()
-                                        ),
-                                    );
-                                }
+        Command::Status { message_id } => {
+            spawn_rpc(client, ui_tx, move |client, ui_tx| async move {
+                match client
+                    .call(m::MESSAGE_STATUS, json!({ "message_id": message_id }))
+                    .await
+                {
+                    Ok(v) => {
+                        if let Ok(r) = serde_json::from_value::<MessageStatusResult>(v) {
+                            out(&ui_tx, format!("acks for message {message_id}:"));
+                            for a in r.acks {
+                                out(
+                                    &ui_tx,
+                                    format!(
+                                        "  {} → {:?}{}",
+                                        a.recipient,
+                                        a.state,
+                                        a.reason.map(|r| format!(" ({r})")).unwrap_or_default()
+                                    ),
+                                );
                             }
                         }
-                        Err(e) => out(&ui_tx, format!("error: {}", e.message)),
                     }
-                });
-            }
-            Err(_) => app.push("usage: /status <message-id>".into()),
-        },
-        "/history" => {
-            let mut it = rest.split_whitespace();
-            let Some(target) = it.next().map(String::from) else {
-                app.push("usage: /history <#channel|@principal> [limit]".into());
-                return;
-            };
-            let limit = it.next().and_then(|v| v.parse::<u32>().ok()).unwrap_or(20);
+                    Err(e) => out(&ui_tx, format!("error: {}", e.message)),
+                }
+            });
+        }
+        Command::History { target, limit } => {
             let scope = if target.starts_with('#') {
                 json!({ "channel": target })
             } else if app.principal != target {
@@ -629,7 +762,7 @@ fn run_command(app: &mut App, client: &Arc<Client>, ui_tx: &mpsc::UnboundedSende
                 }
             });
         }
-        "/who" => {
+        Command::Who => {
             spawn_rpc(client, ui_tx, move |client, ui_tx| async move {
                 match client.call(m::DIRECTORY_WHO, json!({})).await {
                     Ok(v) => {
@@ -654,7 +787,7 @@ fn run_command(app: &mut App, client: &Arc<Client>, ui_tx: &mpsc::UnboundedSende
                 }
             });
         }
-        "/daemon" => {
+        Command::Daemon => {
             spawn_rpc(client, ui_tx, move |client, ui_tx| async move {
                 match client.call(m::DAEMON_STATUS, json!({})).await {
                     Ok(v) => out(&ui_tx, v.to_string()),
@@ -662,8 +795,9 @@ fn run_command(app: &mut App, client: &Arc<Client>, ui_tx: &mpsc::UnboundedSende
                 }
             });
         }
-        "/shutdown" => simple(client, ui_tx, m::DAEMON_SHUTDOWN, json!({})),
-        other => app.push(format!("unknown command {other}; /help")),
+        Command::Shutdown => simple(client, ui_tx, m::DAEMON_SHUTDOWN, json!({})),
+        Command::Usage(text) => app.push(text.into()),
+        Command::Unknown(other) => app.push(format!("unknown command {other}; /help")),
     }
 }
 
@@ -1161,10 +1295,170 @@ mod tests {
             "tail is below the viewport when scrolled back"
         );
 
-        // End key semantics: from_bottom = 0 returns to the tail.
-        app.scroll_from_bottom = 0;
+        // End key returns to the tail.
+        let (ui_tx, _ui_rx) = mpsc::unbounded_channel();
+        handle_key(
+            &mut app,
+            &dummy_client(),
+            &ui_tx,
+            KeyEvent::new(KeyCode::End, KeyModifiers::NONE),
+        );
         draw(&mut terminal, &mut app).unwrap();
         assert!(screen(&terminal).contains("TAILMARK"));
+    }
+
+    #[test]
+    fn parse_command_forms() {
+        // R2: the parser is pure — every form and usage error is testable
+        // without a client, app state, or terminal.
+        assert_eq!(
+            parse_command("hello there"),
+            Command::Post {
+                body: "hello there".into()
+            }
+        );
+        assert_eq!(parse_command("/help"), Command::Help);
+        assert_eq!(parse_command("/quit"), Command::Quit);
+        assert_eq!(
+            parse_command("/focus #general"),
+            Command::Focus {
+                channel: "#general".into()
+            }
+        );
+        assert_eq!(
+            parse_command("/focus general"),
+            Command::Usage("usage: /focus #channel")
+        );
+        assert_eq!(
+            parse_command("/send #a @b the body"),
+            Command::Send {
+                channels: vec!["#a".into()],
+                principals: vec!["@b".into()],
+                body: "the body".into()
+            }
+        );
+        assert_eq!(
+            parse_command("/send no targets"),
+            Command::Usage("usage: /send <#chan|@principal ...> <body>")
+        );
+        assert_eq!(
+            parse_command("/reply 42 #a fix it"),
+            Command::Reply {
+                thread_id: 42,
+                channels: vec!["#a".into()],
+                principals: vec![],
+                body: "fix it".into()
+            }
+        );
+        assert_eq!(
+            parse_command("/reply nope #a x"),
+            Command::Usage("usage: /reply <thread_id> <#chan|@principal ...> <body>")
+        );
+        assert_eq!(
+            parse_command("/thread"),
+            Command::ThreadFocus { thread_id: None }
+        );
+        assert_eq!(
+            parse_command("/thread 7"),
+            Command::ThreadFocus { thread_id: Some(7) }
+        );
+        assert_eq!(
+            parse_command("/sub @a #b"),
+            Command::AdminSubscription {
+                subscribe: true,
+                principal: "@a".into(),
+                channel: "#b".into()
+            }
+        );
+        assert_eq!(
+            parse_command("/unsub @a"),
+            Command::Usage("usage: /unsub @principal #channel")
+        );
+        assert_eq!(
+            parse_command("/rename #old #new"),
+            Command::Rename {
+                old: "#old".into(),
+                new: "#new".into()
+            }
+        );
+        assert_eq!(
+            parse_command("/archive #x"),
+            Command::Archive {
+                channel: "#x".into(),
+                archive: true
+            }
+        );
+        assert_eq!(
+            parse_command("/unarchive #x"),
+            Command::Archive {
+                channel: "#x".into(),
+                archive: false
+            }
+        );
+        assert_eq!(
+            parse_command("/delete #x"),
+            Command::Delete {
+                channel: "#x".into()
+            }
+        );
+        assert_eq!(
+            parse_command("/confirm #x"),
+            Command::Confirm {
+                channel: "#x".into()
+            }
+        );
+        assert_eq!(
+            parse_command("/status 9"),
+            Command::Status { message_id: 9 }
+        );
+        assert_eq!(
+            parse_command("/status abc"),
+            Command::Usage("usage: /status <message-id>")
+        );
+        assert_eq!(
+            parse_command("/history #g 5"),
+            Command::History {
+                target: "#g".into(),
+                limit: 5
+            }
+        );
+        assert_eq!(
+            parse_command("/history #g"),
+            Command::History {
+                target: "#g".into(),
+                limit: 20
+            }
+        );
+        assert_eq!(
+            parse_command("/create #fresh"),
+            Command::Create {
+                name: "#fresh".into()
+            }
+        );
+        assert_eq!(
+            parse_command("/thread nope"),
+            Command::Usage("usage: /thread <thread_id>  (or /thread to clear)")
+        );
+        assert_eq!(
+            parse_command("/sub @only"),
+            Command::Usage("usage: /sub @principal #channel")
+        );
+        assert_eq!(
+            parse_command("/rename #only"),
+            Command::Usage("usage: /rename #old #new")
+        );
+        assert_eq!(
+            parse_command("/history"),
+            Command::Usage("usage: /history <#channel|@principal> [limit]")
+        );
+        assert_eq!(
+            parse_command("/reply 42 no targets"),
+            Command::Usage("usage: /reply <thread_id> <#chan|@principal ...> <body>")
+        );
+        assert_eq!(parse_command("/who"), Command::Who);
+        assert_eq!(parse_command("/daemon"), Command::Daemon);
+        assert_eq!(parse_command("/shutdown"), Command::Shutdown);
+        assert_eq!(parse_command("/bogus x"), Command::Unknown("/bogus".into()));
     }
 
     #[test]

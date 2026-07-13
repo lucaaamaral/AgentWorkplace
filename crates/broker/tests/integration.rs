@@ -2,26 +2,18 @@
 //! delivery-as-request acks, watch streaming, channel lifecycle, and
 //! restart re-evaluation of held state.
 
-use std::collections::VecDeque;
 use std::time::Duration;
 
-use broker::{Broker, BrokerConfig, server};
+use broker::BrokerConfig;
 use protocol::methods as m;
 use protocol::*;
-use serde_json::{Value, json};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
-use tokio::net::{TcpListener, TcpStream};
+use serde_json::json;
+use tokio::io::AsyncWriteExt;
+
+mod common;
+use common::{Client, start_broker};
 
 const T: Duration = Duration::from_secs(5);
-
-async fn start_broker(cfg: BrokerConfig) -> (std::net::SocketAddr, Broker) {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let broker = Broker::new(cfg).unwrap();
-    tokio::spawn(server::serve_listener(broker.clone(), listener));
-    (addr, broker)
-}
 
 fn test_cfg() -> BrokerConfig {
     BrokerConfig {
@@ -37,83 +29,7 @@ fn test_cfg() -> BrokerConfig {
     }
 }
 
-struct Client {
-    reader: tokio::io::Lines<BufReader<OwnedReadHalf>>,
-    writer: OwnedWriteHalf,
-    next_id: u64,
-    queue: VecDeque<Message>,
-}
-
 impl Client {
-    async fn connect(addr: std::net::SocketAddr) -> Client {
-        let stream = TcpStream::connect(addr).await.unwrap();
-        let (r, w) = stream.into_split();
-        Client {
-            reader: BufReader::new(r).lines(),
-            writer: w,
-            next_id: 1,
-            queue: VecDeque::new(),
-        }
-    }
-
-    async fn connect_hello(addr: std::net::SocketAddr) -> Client {
-        let mut c = Client::connect(addr).await;
-        c.call(
-            m::SESSION_HELLO,
-            json!({ "client_info": { "version": "t", "pid": 1, "cwd": "/" } }),
-        )
-        .await
-        .unwrap();
-        c
-    }
-
-    async fn write(&mut self, msg: Message) {
-        let mut line = msg.to_line();
-        line.push('\n');
-        self.writer.write_all(line.as_bytes()).await.unwrap();
-    }
-
-    /// Read straight from the socket, bypassing the local queue. Callers that
-    /// are waiting for something specific scan the queue themselves first and
-    /// park everything else there — never re-reading the queue in the same
-    /// wait loop (that would spin forever without touching the socket).
-    async fn read_socket(&mut self) -> Message {
-        loop {
-            let line = tokio::time::timeout(T, self.reader.next_line())
-                .await
-                .expect("read timeout")
-                .unwrap()
-                .expect("connection closed");
-            if line.trim().is_empty() {
-                continue;
-            }
-            return Message::parse(&line).unwrap();
-        }
-    }
-
-    async fn call(&mut self, method: &str, params: Value) -> Result<Value, RpcError> {
-        let id = self.next_id;
-        self.next_id += 1;
-        self.write(Message::Request(Request {
-            jsonrpc: "2.0".into(),
-            id: Id::Num(id),
-            method: method.into(),
-            params: Some(params),
-        }))
-        .await;
-        loop {
-            match self.read_socket().await {
-                Message::Response(resp) if resp.id == Id::Num(id) => {
-                    return match resp.error {
-                        Some(e) => Err(e),
-                        None => Ok(resp.result.unwrap_or(Value::Null)),
-                    };
-                }
-                other => self.queue.push_back(other),
-            }
-        }
-    }
-
     /// Read (or dig out of the queue) the next message/deliver request.
     async fn next_deliver(&mut self, respond: bool) -> DeliverParams {
         // First check the queue.
