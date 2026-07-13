@@ -39,6 +39,11 @@ pub struct BrokerConfig {
     /// instead of growing without limit. Tests lower it to trip the guard
     /// deterministically.
     pub max_out_queue: usize,
+    /// Admin credential (ADR-0019): admin/register succeeds only with this
+    /// exact token. None = admin registration DISABLED (fail closed) — the
+    /// daemon always resolves one (auto-generated file or configured path)
+    /// before serving.
+    pub admin_token: Option<String>,
 }
 
 impl Default for BrokerConfig {
@@ -52,6 +57,7 @@ impl Default for BrokerConfig {
             auth_token: None,
             codex_token_file: None,
             max_out_queue: 8192,
+            admin_token: None,
         }
     }
 }

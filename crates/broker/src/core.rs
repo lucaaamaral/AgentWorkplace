@@ -668,6 +668,28 @@ impl Broker {
                 )));
             }
         }
+        if admin {
+            // ADR-0019: admin rights require the admin credential. The
+            // supplied value is compared and discarded — never logged,
+            // never echoed, never recorded.
+            let authorized = match (&self.0.cfg.admin_token, &p.admin_token) {
+                (Some(required), Some(supplied)) => required == supplied,
+                _ => false,
+            };
+            if !authorized {
+                self.system_record(
+                    &SystemEvent::RegistrationDenied {
+                        name: p.name.clone(),
+                        reason: "invalid admin credential".into(),
+                    },
+                    None,
+                );
+                return Err(ErrorCode::Unauthorized.to_error(
+                    "admin registration requires the admin token (see the daemon's admin-token \
+                     file, ADR-0019)",
+                ));
+            }
+        }
         if session.principal().is_some() {
             return Err(
                 ErrorCode::AlreadyRegistered.to_error("session already bound to a principal")

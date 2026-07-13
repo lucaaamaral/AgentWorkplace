@@ -33,6 +33,7 @@ fn test_cfg() -> BrokerConfig {
         auth_token: None,
         codex_token_file: None,
         max_out_queue: 8192,
+        admin_token: Some("test-admin".into()),
     }
 }
 
@@ -191,7 +192,10 @@ async fn register_subscribe_send_deliver_ack() {
 
     let mut admin = Client::connect_hello(addr).await;
     admin
-        .call(m::ADMIN_REGISTER, json!({ "name": "@manager" }))
+        .call(
+            m::ADMIN_REGISTER,
+            json!({ "name": "@manager", "admin_token": "test-admin" }),
+        )
         .await
         .unwrap();
     admin.call(m::WATCH_START, json!({})).await.unwrap();
@@ -529,7 +533,10 @@ async fn channel_lifecycle_archive_delete() {
     let (addr, _broker) = start_broker(test_cfg()).await;
     let mut admin = Client::connect_hello(addr).await;
     admin
-        .call(m::ADMIN_REGISTER, json!({ "name": "@manager" }))
+        .call(
+            m::ADMIN_REGISTER,
+            json!({ "name": "@manager", "admin_token": "test-admin" }),
+        )
         .await
         .unwrap();
 
@@ -657,7 +664,10 @@ async fn restart_reevaluates_held_state() {
 
     let mut admin = Client::connect_hello(addr).await;
     admin
-        .call(m::ADMIN_REGISTER, json!({ "name": "@manager" }))
+        .call(
+            m::ADMIN_REGISTER,
+            json!({ "name": "@manager", "admin_token": "test-admin" }),
+        )
         .await
         .unwrap();
 
@@ -696,7 +706,10 @@ async fn restart_reevaluates_held_state() {
 
     let mut admin2 = Client::connect_hello(addr2).await;
     admin2
-        .call(m::ADMIN_REGISTER, json!({ "name": "@manager2" }))
+        .call(
+            m::ADMIN_REGISTER,
+            json!({ "name": "@manager2", "admin_token": "test-admin" }),
+        )
         .await
         .unwrap();
 
@@ -729,7 +742,10 @@ async fn admin_overrides_beat_self_service() {
     let (addr, _broker) = start_broker(test_cfg()).await;
     let mut admin = Client::connect_hello(addr).await;
     admin
-        .call(m::ADMIN_REGISTER, json!({ "name": "@manager" }))
+        .call(
+            m::ADMIN_REGISTER,
+            json!({ "name": "@manager", "admin_token": "test-admin" }),
+        )
         .await
         .unwrap();
 
@@ -793,7 +809,10 @@ async fn forcing_existing_member_is_still_logged() {
     let (addr, _broker) = start_broker(test_cfg()).await;
     let mut admin = Client::connect_hello(addr).await;
     admin
-        .call(m::ADMIN_REGISTER, json!({ "name": "@manager" }))
+        .call(
+            m::ADMIN_REGISTER,
+            json!({ "name": "@manager", "admin_token": "test-admin" }),
+        )
         .await
         .unwrap();
 
@@ -902,6 +921,62 @@ async fn concurrent_claims_have_one_winner() {
         }
     }
     assert_eq!(winners, 1, "exactly one session may claim a principal name");
+}
+
+#[tokio::test]
+async fn admin_registration_requires_the_admin_token() {
+    let (addr, _broker) = start_broker(test_cfg()).await;
+
+    // A watcher (with the credential) to observe the audit trail.
+    let mut watcher = Client::connect_hello(addr).await;
+    watcher
+        .call(
+            m::ADMIN_REGISTER,
+            json!({ "name": "@manager", "admin_token": "test-admin" }),
+        )
+        .await
+        .unwrap();
+    watcher.call(m::WATCH_START, json!({})).await.unwrap();
+
+    // No token → UNAUTHORIZED; wrong token → UNAUTHORIZED. The session can
+    // still register as a plain agent afterwards.
+    let mut agent = Client::connect_hello(addr).await;
+    let err = agent
+        .call(m::ADMIN_REGISTER, json!({ "name": "@sneaky" }))
+        .await
+        .unwrap_err();
+    assert_eq!(err_name(&err), "UNAUTHORIZED");
+    let err = agent
+        .call(
+            m::ADMIN_REGISTER,
+            json!({ "name": "@sneaky", "admin_token": "guess" }),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(err_name(&err), "UNAUTHORIZED");
+    assert!(
+        !err.message.contains("guess"),
+        "the supplied credential must never be echoed"
+    );
+    agent.register("@honest").await;
+
+    // Both denials are audited, without the supplied value.
+    let mut denials = 0;
+    for _ in 0..20 {
+        if let WatchEvent::Record(Record::System {
+            event: SystemEvent::RegistrationDenied { name, reason },
+            ..
+        }) = watcher.next_watch().await
+        {
+            assert_eq!(name, "@sneaky");
+            assert_eq!(reason, "invalid admin credential");
+            denials += 1;
+            if denials == 2 {
+                break;
+            }
+        }
+    }
+    assert_eq!(denials, 2, "denied admin attempts must be audited");
 }
 
 #[tokio::test]

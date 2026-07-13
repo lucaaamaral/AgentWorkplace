@@ -335,6 +335,7 @@ async fn start_broker_with_token(
         auth_token: None,
         codex_token_file,
         max_out_queue: 8192,
+        admin_token: Some("test-admin".into()),
     })
     .unwrap();
     tokio::spawn(server::serve_listener(broker.clone(), listener));
@@ -375,7 +376,10 @@ async fn register_and_send(
 
     let mut admin = Client::connect_hello(addr).await;
     admin
-        .call(m::ADMIN_REGISTER, json!({ "name": "@mgr" }))
+        .call(
+            m::ADMIN_REGISTER,
+            json!({ "name": "@mgr", "admin_token": "test-admin" }),
+        )
         .await
         .unwrap();
     (codex_agent, sent, admin)

@@ -424,6 +424,10 @@ pub struct RegisterParams {
     /// then injected via the app-server instead of the registering connection.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub codex: Option<CodexCoordinates>,
+    /// admin/register only: the admin credential (ADR-0019). The broker
+    /// compares and discards it — it never appears in records or errors.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub admin_token: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -2425,6 +2425,7 @@ dependencies = [
  "clap_complete",
  "crossterm",
  "dirs",
+ "getrandom 0.3.4",
  "ratatui",
  "serde",
  "serde_json",

@@ -106,6 +106,19 @@ fn run_daemon(cfg: config::ConfigFile) -> anyhow::Result<()> {
         auth_token: cfg.broker.auth_token.clone(),
         codex_token_file: cfg.codex.token_file.clone(),
         max_out_queue: broker::BrokerConfig::default().max_out_queue,
+        admin_token: {
+            // ADR-0019: resolve (or first-start generate) the admin
+            // credential before serving; a failure aborts startup — the
+            // daemon never runs with admin registration open or ambiguous.
+            let path = cfg
+                .broker
+                .admin_token_file
+                .clone()
+                .unwrap_or_else(config::default_admin_token_path);
+            let token = config::ensure_admin_token(&path)?;
+            tracing::info!("admin credential: {}", path.display());
+            Some(token)
+        },
     };
     let codex_app_server = cfg.codex.app_server.clone();
     let codex_token_file = cfg.codex.token_file.clone();
@@ -216,7 +229,34 @@ fn run_cli(
     let addr = config::parse_endpoint(&endpoint)?;
     let auth_token = cfg.client.auth_token.clone();
     lazy_start(&addr, auth_token.as_deref())?;
-    tokio::runtime::Runtime::new()?.block_on(tui::run(addr, name, version(), auth_token))
+    // ADR-0019: the TUI admin-registers with the credential the daemon owns.
+    // A lazily-started daemon may still be writing it — retry briefly.
+    let token_path = cfg
+        .client
+        .admin_token_file
+        .clone()
+        .unwrap_or_else(config::default_admin_token_path);
+    let mut admin_token = config::read_admin_token(&token_path);
+    for _ in 0..20 {
+        if admin_token.is_ok() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+        admin_token = config::read_admin_token(&token_path);
+    }
+    let admin_token = admin_token.map_err(|e| {
+        anyhow::anyhow!(
+            "cannot load the admin credential ({e}); for a remote broker, point \
+             [client].admin_token_file at a copy of the daemon's admin-token file"
+        )
+    })?;
+    tokio::runtime::Runtime::new()?.block_on(tui::run(
+        addr,
+        name,
+        version(),
+        auth_token,
+        admin_token,
+    ))
 }
 
 /// Lazy start (daemon.md): spawn a local daemon when nothing is listening on

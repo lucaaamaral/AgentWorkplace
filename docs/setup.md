@@ -161,9 +161,13 @@ message arrive in the Codex window; `/status <msg-id>` should reach
 
 The default posture is **loopback-only trust**: any local process that can
 reach the port is assumed to be yours, and any session can claim any free
-name, admin included. Before adding a non-loopback `listen` address, set
-`[broker].auth_token` everywhere. The full model — what the token does and
-does not protect, the Codex SSRF guard, transport bounds — is in
+agent name. **Admin is the exception**: `admin/register` requires the
+credential the daemon auto-generates into `~/.local/share/workplace/admin-token`
+(0600) on first start — `workplace cli` reads it automatically, agents'
+shims never do ([ADR-0019](decision-records/0019-admin-credential.md)).
+Before adding a non-loopback `listen` address, set `[broker].auth_token`
+everywhere. The full model — what each credential does and does not protect,
+the Codex SSRF guard, transport bounds — is in
 [daemon.md → Trust boundary](architecture/daemon.md#trust-boundary).
 
 ## Troubleshooting
@@ -173,6 +177,7 @@ does not protect, the Codex SSRF guard, transport bounds — is in
 | Agent says it has no `workplace`/bus tools | MCP entry not visible to that session: for Codex, the entry must be in the **global** `~/.codex/config.toml` (a repo-local `.codex/config.toml` only covers sessions started in that repo); for Claude Code, check `claude mcp list` |
 | `workplace cli` fails: "listener at … is not a workplace broker" | Something else owns the port, or a stale daemon predates your config change. `lsof -i :9675`, stop the foreign process or change the port |
 | `UNAUTHORIZED` on connect | `[client].auth_token` missing or different from the broker's `[broker].auth_token` |
+| `workplace cli`: "admin registration … failed" / `UNAUTHORIZED` | The TUI could not present the daemon's admin credential — usually a remote broker (point `[client].admin_token_file` at a copy of the daemon's `admin-token` file, over a trusted link only) or a stale/foreign token file |
 | `NAME_TAKEN` on register | The name is actively claimed by a live session — pick another, or find and close the other session (`/who` marks active names with `*`) |
 | Deliveries to a Codex agent fail: "no push path into this session" | The registration carried no usable codex coordinates: either no `thread_id` was passed to `register`, or the shim entry lacks `--codex-app-server` (the register result carries the same warning naming which half is missing). Fix the named half, then deregister and re-register passing `$CODEX_THREAD_ID` |
 | A Codex agent has two `workplace` MCP entries | Duplicate wiring (e.g. a manually-added entry next to the configured one) — deliveries route by whichever the agent registered through. Remove the duplicate; keep the one with `--codex-app-server` |

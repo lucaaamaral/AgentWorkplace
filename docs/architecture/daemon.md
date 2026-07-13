@@ -43,6 +43,10 @@ message_size_limit = "8MB"
 # broker (see the trust boundary below); set one BEFORE adding any
 # non-loopback listen address.
 # auth_token = ""
+# Admin credential file (ADR-0019). Default: <data dir>/admin-token,
+# auto-generated (0600) on first start; admin/register requires its
+# contents. Override with a path — never an inline secret.
+# admin_token_file = ""
 
 [client]
 # Endpoint that workplace cli and the adapters on this machine dial.
@@ -81,7 +85,7 @@ level = "info"
 
 The broker's authorization model is deliberately thin and must be understood before changing the bind addresses:
 
-- **Any session that passes `session/hello` can register any free principal name, `admin/register` included** — there is no identity beyond the name claim, and admin rights grant the observability tap, DM history between any pair, channel deletion, and `daemon/shutdown`.
+- **Any session that passes `session/hello` can register any free principal name.** There is no identity beyond the name claim — except for admin: **`admin/register` additionally requires the admin credential** ([ADR-0019](../decision-records/0019-admin-credential.md)), auto-generated into `<data dir>/admin-token` (0600) on first daemon start and read automatically by `workplace cli`. Admin rights grant the observability tap, DM history between any pair, channel deletion, and `daemon/shutdown`; denied attempts are audited (`RegistrationDenied`, never echoing the supplied value). An agent that can read the operator's data directory already crosses the host boundary — the bus does not pretend to prevent that.
 - The **default posture is loopback-only**: every process that can reach the port is assumed to be the operator's. That is the whole security model when `auth_token` is unset.
 - **Set `[broker].auth_token` before adding any non-loopback `listen` address.** With a token set, `session/hello` is refused without it (`UNAUTHORIZED`), which gates every other verb. The token is a shared secret in the config file — machine-level protection, not per-principal identity.
 - The broker only ever dials **loopback `ws://` endpoints** as Codex app-servers, whatever a registration self-reports — a wire-supplied URL must not be able to point bus traffic at an arbitrary host.

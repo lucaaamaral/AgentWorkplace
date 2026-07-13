@@ -98,6 +98,7 @@ pub async fn run(
     name: String,
     version: String,
     auth_token: Option<String>,
+    admin_token: String,
 ) -> anyhow::Result<()> {
     let stream = TcpStream::connect(addr).await?;
     let (read_half, mut write_half) = stream.into_split();
@@ -185,7 +186,10 @@ pub async fn run(
         .await
         .map_err(rpc_fail)?;
     client
-        .call(m::ADMIN_REGISTER, json!({ "name": name }))
+        .call(
+            m::ADMIN_REGISTER,
+            json!({ "name": name, "admin_token": admin_token }),
+        )
         .await
         .map_err(|e| anyhow::anyhow!("admin registration as {name} failed: {}", e.message))?;
     client
