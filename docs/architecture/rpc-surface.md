@@ -5,7 +5,7 @@
 ## Wire and trust
 
 - JSON-RPC 2.0 ([ADR-0014](../decision-records/0014-json-rpc-wire-protocol.md)), newline-delimited, on every broker connection. This document is transport-agnostic; the transport is decided in [ADR-0016](../decision-records/0016-tcp-broker-transport.md) and endpoint configuration lives in the [daemon runtime](daemon.md).
-- **No authentication.** The trust model is the local machine or a protected local network ([ADR-0010](../decision-records/0010-local-first-defaults-not-localhost-bound.md)). A security model is deliberately deferred until there are users beyond the operator.
+- **Two optional credentials, one hard rule.** The base trust model is the local machine or a protected local network ([ADR-0010](../decision-records/0010-local-first-defaults-not-localhost-bound.md)): sessions are unauthenticated by default, but `[broker].auth_token`, when configured, gates `session/hello` (`UNAUTHORIZED` without it). The hard rule is admin: **`admin/register` always requires the admin credential** ([ADR-0019](../decision-records/0019-admin-credential.md)) — auto-generated into the daemon's data dir, read automatically by `workplace cli`, never exposed to agent tool surfaces. See the [trust boundary](daemon.md#trust-boundary).
 - Method naming is `namespace/verb`, matching the harness protocols this project integrates with.
 
 ## Roles
@@ -16,15 +16,15 @@ There is no role field and no privileged connection class. A session becomes wha
 - `admin/register` → the **manager**: a participant plus full visibility and the admin verbs.
 - No registration → **observer**: `watch/*` and `session/hello` only.
 
-Admin verbs are honored only on admin-registered sessions. This is role hygiene and security: it makes accidental misuse by an agent structurally impossible (the adapter shims never expose admin tools to models in the first place), while any local process remains free to admin-register.
+Admin verbs are honored only on admin-registered sessions, and admin registration requires the admin credential ([ADR-0019](../decision-records/0019-admin-credential.md)): the adapter shims never expose admin tools or the credential to models, and a local process without the operator's token file gets `UNAUTHORIZED` plus an audited `RegistrationDenied` record.
 
 ## Handshake
 
 | Method | Params | Result |
 | --- | --- | --- |
-| `session/hello` | `{client_info: {harness?, version, pid, cwd}}` | `{broker_version, session_id}` |
+| `session/hello` | `{client_info: {harness?, version, pid, cwd}, auth_token?}` | `{broker_version, session_id}` — or `UNAUTHORIZED` when the broker is configured with an `auth_token` and it is missing/wrong |
 
-First call on every connection. The session is anonymous until it registers; `client_info` feeds liveness display (CL-7 / CX analog).
+First call on every connection (and the CLI's lazy-start health check). The session is anonymous until it registers; `client_info` feeds liveness display (CL-7 / CX analog).
 
 ## Agent surface
 
@@ -32,17 +32,18 @@ The wire mapping of the [tool contract](message-model.md#tool-contract) — same
 
 | Method | Params | Result | Errors |
 | --- | --- | --- | --- |
-| `principal/register` | `{name}` | `{principal}` | `NAME_TAKEN`, `INVALID_NAME` |
+| `principal/register` | `{name, codex?: {app_server, thread_id}}` | `{principal}` | `NAME_TAKEN`, `INVALID_NAME` |
 | `principal/deregister` | `{}` | ok | `NOT_REGISTERED` |
 | `message/send` | `{channels: [], principals: [], body, thread_id?}` | `{message_id, thread_id, delivery}` | `UNKNOWN_NAME`, `NOT_REGISTERED` |
-| `channel/subscribe` | `{channel}` | ok | `UNKNOWN_NAME`, `NOT_REGISTERED` |
-| `channel/unsubscribe` | `{channel}` | ok | `UNKNOWN_NAME`, `NOT_REGISTERED` |
+| `channel/subscribe` | `{channel}` | ok | `UNKNOWN_NAME`, `NOT_REGISTERED`, `OVERRIDE_DENIED` |
+| `channel/unsubscribe` | `{channel}` | ok | `UNKNOWN_NAME`, `NOT_REGISTERED`, `OVERRIDE_DENIED` |
 | `channel/create` | `{name}` | `{channel}` | `NAME_TAKEN`, `INVALID_NAME`, `NOT_REGISTERED` |
 | `history/get` | `{scope, before_message_id?, limit}` | `{records: [], next_cursor?}` | `UNKNOWN_NAME`, `SCOPE_DENIED` |
 | `directory/who` | `{}` | `{channels: [{channel, subscribers: []}], principals: [{principal, active}]}` | — |
 
 - `message/send` result `delivery`: `{delivered: [principal], failed: [{principal, reason}], empty_audience?: "no_subscribers" | "empty_intersection"}` — the delivery report the message model requires. Unknown names error and store nothing; empty audiences succeed and are reported.
 - `history/get` `scope` is an explicit object: `{channel: <name>}` or `{dm_with: <principal>}`. An agent may read any subscribable channel and its own DM threads; anything else is `SCOPE_DENIED`. Cursor is the last `message_id`, records newest-last.
+- The optional `codex` object carries a Codex session's delivery coordinates (CX-7): the shared app-server endpoint (loopback `ws://` only — validated) and the agent's self-reported thread id. `OVERRIDE_DENIED` enforces human-set subscription precedence ([ADR-0009](../decision-records/0009-self-service-subscriptions-human-override.md)).
 - Registration, deregistration, subscription changes, and channel creation produce `system` records in the log.
 
 ## Delivery: request, not notification
@@ -60,7 +61,7 @@ Broker-to-recipient delivery is a JSON-RPC **request whose response is the ackno
 
 ## Admin surface
 
-`admin/register {name}` claims a principal like any registration and additionally grants:
+`admin/register {name, admin_token}` claims a principal like any registration — with the admin credential ([ADR-0019](../decision-records/0019-admin-credential.md)); missing or wrong → `UNAUTHORIZED`, audited as `RegistrationDenied` without echoing the supplied value — and additionally grants:
 
 - **Full visibility**: this session receives `message/deliver` for every message on every channel and every DM. These monitor copies are an **observability tap, not audience membership** — they never appear in delivery reports or per-recipient ack state unless the admin principal was an actual resolved recipient.
 - The admin verbs:
@@ -75,7 +76,7 @@ Broker-to-recipient delivery is a JSON-RPC **request whose response is the ackno
 | `channel/delete` | `{channel}` | Phase one of guarded permanent deletion: returns `{confirmation_token}` — single-use, short-lived, bound to this session and channel |
 | `channel/delete_confirm` | `{channel, confirmation_token}` | Phase two: physically removes the channel and its records, writes a tombstone `system` record, frees the name ([ADR-0018](../decision-records/0018-channel-lifecycle-archive-and-guarded-deletion.md)) |
 | `message/status` | `{message_id}` | Per-recipient acknowledgment states with per-state timestamps and retained failure reasons |
-| `daemon/status` | `{}` | Version, uptime, connected sessions (`client_info`, bound principal), channel/principal counts. Also the CLI's lazy-start health check |
+| `daemon/status` | `{}` | Version, uptime, connected sessions (`client_info`, bound principal), channel/principal counts |
 | `daemon/shutdown` | `{}` | Graceful stop |
 
 - Deletion always crosses at least two deliberate steps: the two-phase token handshake at the protocol, plus the interface's own confirmation (the TUI requires typing the channel name verbatim) — see [ADR-0018](../decision-records/0018-channel-lifecycle-archive-and-guarded-deletion.md).
@@ -109,5 +110,7 @@ Application error codes, stable symbolic names in `error.data.code`:
 | -32006 | `SHUTTING_DOWN` | Broker is stopping; retry against the next daemon |
 | -32007 | `SCOPE_DENIED` | History scope outside the caller's visibility (e.g. another pair's DMs) |
 | -32008 | `BAD_CONFIRMATION` | Deletion token missing, expired, already used, or bound to another session/channel |
+| -32009 | `UNAUTHORIZED` | Missing/invalid `auth_token` at `session/hello`, or missing/invalid admin credential at `admin/register` ([ADR-0019](../decision-records/0019-admin-credential.md)) |
+| -32010 | `OVERRIDE_DENIED` | Self-service subscription change against human-set precedence ([ADR-0009](../decision-records/0009-self-service-subscriptions-human-override.md)) |
 
 Broker-unreachable is not an error code: it is the adapter failing the agent's tool call locally, per the message model.
