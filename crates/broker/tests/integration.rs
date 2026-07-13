@@ -171,6 +171,36 @@ impl Client {
         }
     }
 
+    /// Assert that no watch notification arrives during a short window while
+    /// preserving unrelated protocol traffic for subsequent helpers.
+    async fn assert_no_watch(&mut self, window: Duration) {
+        assert!(
+            !self
+                .queue
+                .iter()
+                .any(|m| matches!(m, Message::Notification(n) if n.method == m::WATCH_EVENT)),
+            "unexpected queued watch event"
+        );
+        let deadline = tokio::time::Instant::now() + window;
+        while tokio::time::Instant::now() < deadline {
+            let remaining = deadline - tokio::time::Instant::now();
+            match tokio::time::timeout(remaining, self.reader.next_line()).await {
+                Ok(Ok(Some(line))) => {
+                    if line.trim().is_empty() {
+                        continue;
+                    }
+                    let msg = Message::parse(&line).unwrap();
+                    assert!(
+                        !matches!(&msg, Message::Notification(n) if n.method == m::WATCH_EVENT),
+                        "unexpected watch event: {msg:?}"
+                    );
+                    self.queue.push_back(msg);
+                }
+                Ok(Ok(None)) | Ok(Err(_)) | Err(_) => return,
+            }
+        }
+    }
+
     async fn register(&mut self, name: &str) {
         self.call(m::PRINCIPAL_REGISTER, json!({ "name": name }))
             .await
@@ -184,6 +214,22 @@ fn err_name(e: &RpcError) -> String {
         .and_then(|d| d["code"].as_str())
         .unwrap_or_default()
         .to_string()
+}
+
+async fn wait_for_ack_state(admin: &mut Client, message_id: u64, expected: AckState) -> AckStatus {
+    for _ in 0..50 {
+        let value = admin
+            .call(m::MESSAGE_STATUS, json!({ "message_id": message_id }))
+            .await
+            .unwrap();
+        let result: MessageStatusResult = serde_json::from_value(value).unwrap();
+        let ack = result.acks.into_iter().next().expect("ack row");
+        if ack.state == expected {
+            return ack;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("ack for message {message_id} did not reach {expected:?}");
 }
 
 #[tokio::test]
@@ -1022,6 +1068,249 @@ async fn auth_token_gates_hello() {
     .await
     .unwrap();
     ok.register("@authed").await;
+}
+
+#[tokio::test]
+async fn channel_watch_filters_exclude_other_channels_and_dms() {
+    let (addr, _broker) = start_broker(test_cfg()).await;
+
+    let mut sender = Client::connect_hello(addr).await;
+    sender.register("@sender").await;
+    sender
+        .call(m::CHANNEL_CREATE, json!({ "name": "#wanted" }))
+        .await
+        .unwrap();
+    sender
+        .call(m::CHANNEL_CREATE, json!({ "name": "#other" }))
+        .await
+        .unwrap();
+    let mut recipient = Client::connect_hello(addr).await;
+    recipient.register("@recipient").await;
+
+    // Start both watches only after setup, so the assertions below observe
+    // exclusively the records produced by these sends.
+    let mut filtered = Client::connect_hello(addr).await;
+    filtered
+        .call(m::WATCH_START, json!({ "channels": ["#wanted"] }))
+        .await
+        .unwrap();
+    let mut all = Client::connect_hello(addr).await;
+    all.call(m::WATCH_START, json!({})).await.unwrap();
+
+    sender
+        .call(
+            m::MESSAGE_SEND,
+            json!({ "channels": ["#wanted"], "body": "visible" }),
+        )
+        .await
+        .unwrap();
+    let WatchEvent::Record(Record::Message { envelope }) = filtered.next_watch().await else {
+        panic!("filtered watcher should receive the selected channel")
+    };
+    assert_eq!(envelope.body, "visible");
+    let _ = all.next_watch().await;
+
+    sender
+        .call(
+            m::MESSAGE_SEND,
+            json!({ "channels": ["#other"], "body": "hidden-channel" }),
+        )
+        .await
+        .unwrap();
+    let WatchEvent::Record(Record::Message { envelope }) = all.next_watch().await else {
+        panic!("unfiltered watcher should receive the other channel")
+    };
+    assert_eq!(envelope.body, "hidden-channel");
+
+    sender
+        .call(
+            m::MESSAGE_SEND,
+            json!({ "principals": ["@recipient"], "body": "hidden-dm" }),
+        )
+        .await
+        .unwrap();
+    let WatchEvent::Record(Record::Message { envelope }) = all.next_watch().await else {
+        panic!("unfiltered watcher should receive DMs")
+    };
+    assert_eq!(envelope.body, "hidden-dm");
+    filtered.assert_no_watch(Duration::from_millis(200)).await;
+}
+
+#[tokio::test]
+async fn only_bound_recipient_can_report_processed() {
+    let (addr, _broker) = start_broker(test_cfg()).await;
+    let mut admin = Client::connect_hello(addr).await;
+    admin
+        .call(
+            m::ADMIN_REGISTER,
+            json!({ "name": "@manager", "admin_token": "test-admin" }),
+        )
+        .await
+        .unwrap();
+    let mut sender = Client::connect_hello(addr).await;
+    sender.register("@sender").await;
+    let mut recipient = Client::connect_hello(addr).await;
+    recipient.register("@recipient").await;
+    let mut imposter = Client::connect_hello(addr).await;
+    imposter.register("@imposter").await;
+
+    let sent: SendResult = serde_json::from_value(
+        sender
+            .call(
+                m::MESSAGE_SEND,
+                json!({ "principals": ["@recipient"], "body": "guard me" }),
+            )
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    recipient.next_deliver(true).await;
+    wait_for_ack_state(&mut admin, sent.message_id, AckState::Relayed).await;
+
+    // A different bound session cannot advance @recipient's acknowledgment.
+    imposter
+        .write(Message::Notification(notification(
+            m::MESSAGE_PROCESSED,
+            json!({ "message_id": sent.message_id, "recipient": "@recipient" }),
+        )))
+        .await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let ack = wait_for_ack_state(&mut admin, sent.message_id, AckState::Relayed).await;
+    assert!(ack.processed_at.is_none());
+
+    recipient
+        .write(Message::Notification(notification(
+            m::MESSAGE_PROCESSED,
+            json!({ "message_id": sent.message_id, "recipient": "@recipient" }),
+        )))
+        .await;
+    wait_for_ack_state(&mut admin, sent.message_id, AckState::Processed).await;
+}
+
+#[tokio::test]
+async fn rename_works_for_live_and_archived_channels() {
+    let (addr, _broker) = start_broker(test_cfg()).await;
+    let mut admin = Client::connect_hello(addr).await;
+    admin
+        .call(
+            m::ADMIN_REGISTER,
+            json!({ "name": "@manager", "admin_token": "test-admin" }),
+        )
+        .await
+        .unwrap();
+    let mut agent = Client::connect_hello(addr).await;
+    agent.register("@agent").await;
+    agent
+        .call(m::CHANNEL_CREATE, json!({ "name": "#old" }))
+        .await
+        .unwrap();
+
+    admin
+        .call(
+            m::CHANNEL_RENAME,
+            json!({ "channel": "#old", "new_name": "#live" }),
+        )
+        .await
+        .unwrap();
+    let who: WhoResult =
+        serde_json::from_value(agent.call(m::DIRECTORY_WHO, json!({})).await.unwrap()).unwrap();
+    assert!(who.channels.iter().any(|c| c.channel == "#live"));
+    assert!(!who.channels.iter().any(|c| c.channel == "#old"));
+
+    admin
+        .call(m::CHANNEL_ARCHIVE, json!({ "channel": "#live" }))
+        .await
+        .unwrap();
+    admin
+        .call(
+            m::CHANNEL_RENAME,
+            json!({ "channel": "#live", "new_name": "#archived" }),
+        )
+        .await
+        .unwrap();
+
+    // Renaming an archived channel frees its former name while preserving
+    // the archived channel and its history under the new name.
+    agent
+        .call(m::CHANNEL_CREATE, json!({ "name": "#live" }))
+        .await
+        .unwrap();
+    let history: HistoryResult = serde_json::from_value(
+        admin
+            .call(
+                m::HISTORY_GET,
+                json!({ "scope": { "channel": "#archived" }, "limit": 20 }),
+            )
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert!(history.records.iter().any(|record| matches!(
+        record,
+        Record::System {
+            event: SystemEvent::ChannelRenamed { old_name, new_name, .. },
+            ..
+        } if old_name == "#live" && new_name == "#archived"
+    )));
+}
+
+#[tokio::test]
+async fn rpc_guards_status_and_watch_stop() {
+    let (addr, _broker) = start_broker(test_cfg()).await;
+
+    let mut observer = Client::connect(addr).await;
+    let err = observer
+        .call(m::DIRECTORY_WHO, json!({}))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code, -32600);
+    assert!(err.message.contains("session/hello"));
+    observer
+        .call(
+            m::SESSION_HELLO,
+            json!({ "client_info": { "version": "t", "pid": 1, "cwd": "/" } }),
+        )
+        .await
+        .unwrap();
+    let err = observer
+        .call("no/such-method", json!({}))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code, -32601);
+
+    observer.call(m::WATCH_START, json!({})).await.unwrap();
+    observer.call(m::WATCH_STOP, json!({})).await.unwrap();
+    let mut agent = Client::connect_hello(addr).await;
+    agent.register("@agent").await;
+    observer.assert_no_watch(Duration::from_millis(200)).await;
+
+    let err = agent.call(m::DAEMON_STATUS, json!({})).await.unwrap_err();
+    assert_eq!(err_name(&err), "NOT_ADMIN");
+    let mut admin = Client::connect_hello(addr).await;
+    admin
+        .call(
+            m::ADMIN_REGISTER,
+            json!({ "name": "@manager", "admin_token": "test-admin" }),
+        )
+        .await
+        .unwrap();
+    let status: DaemonStatusResult =
+        serde_json::from_value(admin.call(m::DAEMON_STATUS, json!({})).await.unwrap()).unwrap();
+    assert_eq!(status.broker_version, "test");
+    assert_eq!(status.principal_count, 2);
+    assert_eq!(status.channel_count, 0);
+    assert!(
+        status
+            .sessions
+            .iter()
+            .any(|s| s.principal.as_deref() == Some("@manager") && s.admin)
+    );
+    assert!(
+        status
+            .sessions
+            .iter()
+            .any(|s| s.principal.as_deref() == Some("@agent") && !s.admin)
+    );
 }
 
 #[tokio::test]

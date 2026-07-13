@@ -979,6 +979,69 @@ fn row_to_record(r: &rusqlite::Row<'_>) -> rusqlite::Result<Record> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn acknowledgment_state_is_monotonic_but_records_late_timestamps() {
+        let store = Store::open_in_memory().unwrap();
+        let recipients = Recipients {
+            channels: vec![],
+            principals: vec!["@recipient".into()],
+        };
+        let envelope = store
+            .append_message_with_acks(
+                "@sender",
+                &recipients,
+                "body",
+                false,
+                None,
+                &[],
+                &["@recipient".into()],
+                &[],
+            )
+            .unwrap();
+        assert_eq!(
+            store.acks_for(envelope.message_id).unwrap()[0].state,
+            AckState::Held
+        );
+
+        assert!(
+            store
+                .ack_set(envelope.message_id, "@recipient", AckState::Processed, None,)
+                .unwrap()
+                .is_some()
+        );
+        // Delivery completion and failure can race with a late relayed write.
+        // Lower-ranked and tied terminal states record their own timestamp but
+        // cannot replace the already-observed terminal state.
+        assert!(
+            store
+                .ack_set(envelope.message_id, "@recipient", AckState::Relayed, None,)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .ack_set(
+                    envelope.message_id,
+                    "@recipient",
+                    AckState::Failed,
+                    Some("late failure"),
+                )
+                .unwrap()
+                .is_none()
+        );
+
+        let ack = &store.acks_for(envelope.message_id).unwrap()[0];
+        assert_eq!(ack.state, AckState::Processed);
+        assert!(ack.held_at.is_some());
+        assert!(ack.relayed_at.is_some());
+        assert!(ack.processed_at.is_some());
+        assert!(ack.failed_at.is_some());
+        assert!(
+            ack.reason.is_none(),
+            "stale failure must not replace reason"
+        );
+    }
+
     /// Corrupt persisted JSON must surface as an error, never degrade into
     /// an empty audience or a skipped record.
     #[test]
