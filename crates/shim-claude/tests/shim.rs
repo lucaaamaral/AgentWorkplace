@@ -12,6 +12,7 @@ use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 struct Harness {
     mcp_in: DuplexStream,
     mcp_out: tokio::io::Lines<BufReader<DuplexStream>>,
+    listener: TcpListener,
     broker_in: tokio::io::Lines<BufReader<OwnedReadHalf>>,
     broker_out: OwnedWriteHalf,
     next_mcp_id: u64,
@@ -38,6 +39,7 @@ impl Harness {
         let mut h = Harness {
             mcp_in: mcp_in_test,
             mcp_out: BufReader::new(mcp_out_test).lines(),
+            listener,
             broker_in: BufReader::new(r).lines(),
             broker_out: w,
             next_mcp_id: 1,
@@ -47,6 +49,26 @@ impl Harness {
         h.broker_respond(&hello, json!({ "broker_version": "t", "session_id": 1 }))
             .await;
         h
+    }
+
+    /// Kill the broker connection (FIN) and accept the shim's automatic
+    /// reconnect, answering the fresh session/hello. Everything after the
+    /// hello (the binding replay) is the caller's to assert.
+    async fn sever_and_reaccept(&mut self) {
+        self.broker_out.shutdown().await.unwrap();
+        // Reconnect backoff is 1s for a short-lived connection; allow slack.
+        let (stream, _) =
+            tokio::time::timeout(std::time::Duration::from_secs(10), self.listener.accept())
+                .await
+                .expect("shim did not reconnect")
+                .unwrap();
+        let (r, w) = stream.into_split();
+        self.broker_in = BufReader::new(r).lines();
+        self.broker_out = w;
+        let hello = self.broker_next().await;
+        assert_eq!(hello["method"], "session/hello");
+        self.broker_respond(&hello, json!({ "broker_version": "t", "session_id": 2 }))
+            .await;
     }
 
     async fn broker_next(&mut self) -> Value {
@@ -236,5 +258,55 @@ async fn flagless_shim_ignoring_thread_id_warns_and_fails_delivery() {
     assert!(
         err.contains("no push path"),
         "failure must name the cause: {err}"
+    );
+}
+
+/// C2 — the shim carries its binding across broker restarts (CL-6): after a
+/// dropped connection it reconnects, re-hellos, and replays principal/register
+/// with the EXACT original params — codex coordinates included — with no MCP
+/// activity from the session.
+#[tokio::test]
+async fn reconnect_replays_the_full_binding() {
+    let mut h = Harness::start(Some("ws://127.0.0.1:9701")).await;
+    let (params, _text) = h
+        .register(json!({ "name": "@cx", "thread_id": "th-9" }))
+        .await;
+    assert_eq!(params["codex"]["thread_id"], "th-9");
+
+    h.sever_and_reaccept().await;
+
+    // The replay arrives unprompted and must be byte-equivalent in content.
+    let replay = h.broker_next().await;
+    assert_eq!(replay["method"], "principal/register");
+    assert_eq!(
+        replay["params"], params,
+        "reconnect must replay the original binding verbatim (coordinates included)"
+    );
+    h.broker_respond(&replay, json!({ "principal": "@cx" }))
+        .await;
+}
+
+/// C2 — the no-push-path state survives reconnects: a coordinate-less codex
+/// registration keeps failing deliveries honestly after the broker link
+/// bounces (the mismatch is a property of the binding, not the connection).
+#[tokio::test]
+async fn no_push_path_state_survives_reconnect() {
+    let mut h = Harness::start(Some("ws://127.0.0.1:9701")).await;
+    let (_params, text) = h.register(json!({ "name": "@cx" })).await;
+    assert!(text.contains("WARNING"));
+
+    h.sever_and_reaccept().await;
+    let replay = h.broker_next().await;
+    assert_eq!(replay["method"], "principal/register");
+    h.broker_respond(&replay, json!({ "principal": "@cx" }))
+        .await;
+
+    let resp = h
+        .broker_request(600, "message/deliver", deliver_params("still lost?"))
+        .await;
+    let err = resp["error"]["message"].as_str().unwrap();
+    assert!(
+        err.contains("no push path"),
+        "delivery block must persist across reconnect: {err}"
     );
 }
