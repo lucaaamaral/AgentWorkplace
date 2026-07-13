@@ -325,8 +325,13 @@ fn handle_key(
             app.input.pop();
         }
         KeyCode::Tab => complete_command(app),
+        // Scroll state is in RENDERED rows (wrap-aware); draw clamps it to
+        // the actual content height.
+        KeyCode::Up => app.scroll_from_bottom = app.scroll_from_bottom.saturating_add(1),
+        KeyCode::Down => app.scroll_from_bottom = app.scroll_from_bottom.saturating_sub(1),
         KeyCode::PageUp => app.scroll_from_bottom = app.scroll_from_bottom.saturating_add(10),
         KeyCode::PageDown => app.scroll_from_bottom = app.scroll_from_bottom.saturating_sub(10),
+        KeyCode::End => app.scroll_from_bottom = 0,
         KeyCode::Enter => {
             let line = std::mem::take(&mut app.input);
             let line = line.trim().to_string();
@@ -866,9 +871,23 @@ commands:
   /shutdown                  /quit
 ";
 
+/// Bottom-anchored viewport math in RENDERED rows: given the wrap-aware
+/// content height, the pane height, and the requested scroll-back, returns
+/// the Paragraph scroll offset from the top and the clamped scroll state
+/// (over-scrolling past the oldest row sticks at the top).
+fn scroll_offset_rows(total_rows: usize, viewport_rows: usize, from_bottom: u16) -> (u16, u16) {
+    let max_from_bottom = total_rows.saturating_sub(viewport_rows);
+    let clamped = (from_bottom as usize).min(max_from_bottom);
+    let offset = max_from_bottom - clamped;
+    (
+        offset.min(u16::MAX as usize) as u16,
+        clamped.min(u16::MAX as usize) as u16,
+    )
+}
+
 fn draw(
     terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
-    app: &App,
+    app: &mut App,
 ) -> anyhow::Result<()> {
     terminal.draw(|f| {
         let chunks = Layout::default()
@@ -876,14 +895,22 @@ fn draw(
             .constraints([Constraint::Min(3), Constraint::Length(3)])
             .split(f.area());
 
-        let height = chunks[0].height.saturating_sub(2) as usize;
-        let total = app.lines.len();
-        let bottom = total.saturating_sub(app.scroll_from_bottom as usize);
-        let start = bottom.saturating_sub(height);
-        let visible: Vec<Line> = app.lines[start..bottom]
-            .iter()
-            .map(|l| Line::from(l.as_str()))
-            .collect();
+        // Scroll in RENDERED rows, not logical lines: long bus messages wrap
+        // to several terminal rows, and slicing logical lines used to leave
+        // the tail clipped below the pane. line_count is the renderer's own
+        // wrap math (recomputed per frame; bounded by the 5000-line cap).
+        let inner_width = chunks[0].width.saturating_sub(2);
+        let viewport = chunks[0].height.saturating_sub(2) as usize;
+        let stream = Paragraph::new(
+            app.lines
+                .iter()
+                .map(|l| Line::from(l.as_str()))
+                .collect::<Vec<_>>(),
+        )
+        .wrap(Wrap { trim: false });
+        let total_rows = stream.line_count(inner_width);
+        let (offset, clamped) = scroll_offset_rows(total_rows, viewport, app.scroll_from_bottom);
+        app.scroll_from_bottom = clamped;
         let title = format!(
             " workplace · {} · {}{}{} ",
             app.addr,
@@ -897,8 +924,8 @@ fn draw(
                 .unwrap_or_default()
         );
         f.render_widget(
-            Paragraph::new(visible)
-                .wrap(Wrap { trim: false })
+            stream
+                .scroll((offset, 0))
                 .block(Block::default().borders(Borders::ALL).title(title)),
             chunks[0],
         );
@@ -1077,6 +1104,21 @@ mod tests {
         assert_eq!(app.scroll_from_bottom, 10);
         handle_key(&mut app, &client, &ui_tx, key(KeyCode::PageDown));
         assert_eq!(app.scroll_from_bottom, 0);
+    }
+
+    #[test]
+    fn scroll_offset_rows_math() {
+        // Content shorter than the viewport: pinned to top, no scroll-back.
+        assert_eq!(scroll_offset_rows(10, 20, 0), (0, 0));
+        assert_eq!(scroll_offset_rows(10, 20, 7), (0, 0));
+        // Exact fit.
+        assert_eq!(scroll_offset_rows(20, 20, 5), (0, 0));
+        // Longer content, at the tail: offset shows the newest rows.
+        assert_eq!(scroll_offset_rows(50, 20, 0), (30, 0));
+        // Scrolled back within range.
+        assert_eq!(scroll_offset_rows(50, 20, 12), (18, 12));
+        // Over-scroll clamps at the oldest row.
+        assert_eq!(scroll_offset_rows(50, 20, 999), (0, 30));
     }
 
     #[test]

@@ -29,7 +29,10 @@ serde_json = "1"
 rusqlite = { version = "0.40", features = ["bundled"] }
 clap = { version = "4", features = ["derive"] }
 clap_complete = "4"
-ratatui = "0.30"
+# unstable-rendered-line-info: Paragraph::line_count, the wrap-aware row
+# count the TUI scroll needs; explicitly unstable upstream — a future bump
+# breaks compile loudly, never scroll math silently (see tui::draw).
+ratatui = { version = "0.30", features = ["unstable-rendered-line-info"] }
 crossterm = "0.29"
 toml = "1"
 dirs = "6"
