@@ -14,6 +14,8 @@ struct Timings {
     probe_timeout: Duration,
     backoff_initial: Duration,
     backoff_max: Duration,
+    verify_backoff_initial: Duration,
+    verify_backoff_max: Duration,
     stable_uptime: Duration,
     absent_debounce: usize,
 }
@@ -25,6 +27,8 @@ impl Default for Timings {
             probe_timeout: Duration::from_secs(2),
             backoff_initial: Duration::from_secs(1),
             backoff_max: Duration::from_secs(30),
+            verify_backoff_initial: Duration::from_secs(5),
+            verify_backoff_max: Duration::from_secs(60),
             stable_uptime: Duration::from_secs(30),
             absent_debounce: 2,
         }
@@ -128,29 +132,44 @@ async fn supervise_with<F>(
     let mut absent_reads = 0usize;
     let mut healthy_since: Option<tokio::time::Instant> = None;
     let mut backoff = timings.backoff_initial;
+    let mut verify_backoff = timings.verify_backoff_initial;
+    let mut next_verify: Option<tokio::time::Instant> = None;
     let mut last_observation = "";
 
     loop {
         match ready_probe(&endpoint, timings.probe_timeout).await {
             ProbeState::Ready => {
                 absent_reads = 0;
-                if !verified {
+                let now = tokio::time::Instant::now();
+                let verify_due = next_verify.is_none_or(|deadline| now >= deadline);
+                if !verified && verify_due {
                     match deep_verify(&endpoint.url, token_file.as_deref()).await {
                         Ok(()) => {
                             tracing::info!(endpoint = endpoint.url, "codex app-server adopted");
                             verified = true;
                             healthy_since = Some(tokio::time::Instant::now());
+                            verify_backoff = timings.verify_backoff_initial;
+                            next_verify = None;
                             last_observation = "healthy";
                         }
                         Err(error) => {
                             if last_observation != "occupied" {
-                                tracing::error!(
-                                    endpoint = endpoint.url,
-                                    "codex app-server endpoint is occupied but cannot be adopted: {error}"
-                                );
+                                if child.is_some() {
+                                    tracing::warn!(
+                                        endpoint = endpoint.url,
+                                        "spawned codex app-server is not yet adoptable: {error}"
+                                    );
+                                } else {
+                                    tracing::error!(
+                                        endpoint = endpoint.url,
+                                        "codex app-server endpoint is occupied but cannot be adopted: {error}"
+                                    );
+                                }
                             }
                             last_observation = "occupied";
                             healthy_since = None;
+                            next_verify = Some(tokio::time::Instant::now() + verify_backoff);
+                            verify_backoff = (verify_backoff * 2).min(timings.verify_backoff_max);
                         }
                     }
                 } else if healthy_since.is_some_and(|since| {
@@ -161,15 +180,24 @@ async fn supervise_with<F>(
             }
             ProbeState::Occupied(reason) => {
                 if last_observation != "occupied" {
-                    tracing::error!(
-                        endpoint = endpoint.url,
-                        "codex app-server endpoint is occupied but unhealthy/foreign: {reason}"
-                    );
+                    if child.is_some() {
+                        tracing::warn!(
+                            endpoint = endpoint.url,
+                            "spawned codex app-server is not ready: {reason}"
+                        );
+                    } else {
+                        tracing::error!(
+                            endpoint = endpoint.url,
+                            "codex app-server endpoint is occupied but unhealthy/foreign: {reason}"
+                        );
+                    }
                 }
                 last_observation = "occupied";
                 absent_reads = 0;
                 verified = false;
                 healthy_since = None;
+                verify_backoff = timings.verify_backoff_initial;
+                next_verify = None;
             }
             ProbeState::Absent(reason) => {
                 if last_observation != "absent" {
@@ -178,6 +206,8 @@ async fn supervise_with<F>(
                 last_observation = "absent";
                 verified = false;
                 healthy_since = None;
+                verify_backoff = timings.verify_backoff_initial;
+                next_verify = None;
                 absent_reads = absent_reads.saturating_add(1);
                 if absent_reads >= timings.absent_debounce && child.is_none() {
                     tracing::info!(endpoint = endpoint.url, "starting codex app-server");
@@ -475,6 +505,8 @@ mod tests {
             probe_timeout: Duration::from_millis(200),
             backoff_initial: Duration::from_millis(5),
             backoff_max: Duration::from_millis(20),
+            verify_backoff_initial: Duration::from_millis(60),
+            verify_backoff_max: Duration::from_millis(100),
             stable_uptime: Duration::from_millis(30),
             absent_debounce: 2,
         }
@@ -591,7 +623,13 @@ mod tests {
         ));
 
         wait_until(|| server.stats.initializes.load(Ordering::SeqCst) >= 1).await;
-        tokio::time::sleep(Duration::from_millis(30)).await;
+        tokio::time::sleep(Duration::from_millis(35)).await;
+        assert_eq!(
+            server.stats.initializes.load(Ordering::SeqCst),
+            1,
+            "failed deep verification must not repeat at the 10ms poll cadence"
+        );
+        wait_until(|| server.stats.initializes.load(Ordering::SeqCst) >= 2).await;
         assert_eq!(spawns.load(Ordering::SeqCst), 0);
         supervisor.abort();
     }
