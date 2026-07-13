@@ -33,7 +33,8 @@ enum Ui {
         token: String,
     },
     Disconnected,
-    Tick,
+    /// Repaint request without state change (terminal resize).
+    Redraw,
 }
 
 struct Client {
@@ -208,22 +209,13 @@ pub async fn run(
                             break;
                         }
                     }
+                    Ok(Event::Resize(_, _)) => {
+                        if ui_tx.send(Ui::Redraw).is_err() {
+                            break;
+                        }
+                    }
                     Ok(_) => {}
                     Err(_) => break,
-                }
-            }
-        });
-    }
-
-    // Tick for redraw.
-    {
-        let ui_tx = ui_tx.clone();
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(std::time::Duration::from_millis(250));
-            loop {
-                interval.tick().await;
-                if ui_tx.send(Ui::Tick).is_err() {
-                    break;
                 }
             }
         });
@@ -301,7 +293,7 @@ async fn event_loop(
                 app.pending_delete = Some((channel, token));
             }
             Ui::Disconnected => app.push("!! broker connection lost — /quit and relaunch".into()),
-            Ui::Tick => {}
+            Ui::Redraw => {}
             Ui::Input(key) => handle_key(app, client, ui_tx, key),
         }
         if app.quit {
@@ -885,10 +877,11 @@ fn scroll_offset_rows(total_rows: usize, viewport_rows: usize, from_bottom: u16)
     )
 }
 
-fn draw(
-    terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
-    app: &mut App,
-) -> anyhow::Result<()> {
+fn draw<B>(terminal: &mut Terminal<B>, app: &mut App) -> anyhow::Result<()>
+where
+    B: ratatui::backend::Backend,
+    B::Error: std::error::Error + Send + Sync + 'static,
+{
     terminal.draw(|f| {
         let chunks = Layout::default()
             .direction(Direction::Vertical)
@@ -1119,6 +1112,59 @@ mod tests {
         assert_eq!(scroll_offset_rows(50, 20, 12), (18, 12));
         // Over-scroll clamps at the oldest row.
         assert_eq!(scroll_offset_rows(50, 20, 999), (0, 30));
+    }
+
+    /// The blocking gap from review: prove line_count + Wrap + scroll put
+    /// the right ROWS on screen, not just that the offset math is sound.
+    #[test]
+    fn render_shows_wrapped_tail_and_scrolls_to_history() {
+        use ratatui::backend::TestBackend;
+
+        let addr: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let mut app = App::new(addr, "@m".into());
+        for i in 0..20 {
+            app.push(format!("early-{i}"));
+        }
+        // One long message that wraps across several rows of a narrow pane.
+        app.push(format!("LONGSTART {} TAILMARK", "x".repeat(150)));
+
+        let mut terminal = Terminal::new(TestBackend::new(40, 12)).unwrap();
+        let screen = |t: &Terminal<TestBackend>| {
+            t.backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(|c| c.symbol())
+                .collect::<String>()
+        };
+
+        // At the tail (from_bottom = 0) the END of the wrapped message must
+        // be visible — exactly what the logical-line slicing clipped.
+        draw(&mut terminal, &mut app).unwrap();
+        let s = screen(&terminal);
+        assert!(
+            s.contains("TAILMARK"),
+            "newest wrapped rows must be visible"
+        );
+        assert!(!s.contains("early-0"), "oldest rows are above the viewport");
+
+        // Scrolled far back: history becomes visible, the tail leaves.
+        app.scroll_from_bottom = u16::MAX;
+        draw(&mut terminal, &mut app).unwrap();
+        let s = screen(&terminal);
+        assert!(
+            s.contains("early-0"),
+            "over-scroll clamps at the oldest row"
+        );
+        assert!(
+            !s.contains("TAILMARK"),
+            "tail is below the viewport when scrolled back"
+        );
+
+        // End key semantics: from_bottom = 0 returns to the tail.
+        app.scroll_from_bottom = 0;
+        draw(&mut terminal, &mut app).unwrap();
+        assert!(screen(&terminal).contains("TAILMARK"));
     }
 
     #[test]
