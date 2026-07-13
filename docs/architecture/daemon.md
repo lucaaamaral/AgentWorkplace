@@ -95,7 +95,7 @@ The broker's authorization model is deliberately thin and must be understood bef
 
 ## Codex app-server supervision
 
-When `[codex].app_server` is set, the daemon keeps a shared `codex app-server --listen <endpoint>` alive for `codex --remote` sessions to attach to. It supervises the **endpoint**, not merely a child it owns — which is what makes a broker restart zero-downtime for Codex.
+When `[codex].app_server` is set, the daemon keeps a shared `codex app-server --listen <endpoint>` alive for `codex --remote` sessions to attach to. It supervises the **endpoint**, not merely a child it owns — so the Codex engine and attached `codex --remote` windows survive a broker restart. (Continuity here means the app-server and its sessions: the broker's own JSON-RPC is briefly unavailable while the daemon restarts.)
 
 **State machine.** Roughly every two seconds the daemon runs a shallow readiness probe — a `GET /readyz` over TCP to the endpoint's host:port — and acts on the result:
 
@@ -105,11 +105,11 @@ When `[codex].app_server` is set, the daemon keeps a shared `codex app-server --
 
 The endpoint the daemon adopts may be one it spawned or one **left running by a previous daemon** — adopting either is what makes broker restarts transparent to attached Codex sessions.
 
-**Detached lifetime (zero-downtime).** A spawned app-server is deliberately **not** bound to the daemon's lifetime: it is started detached — `kill_on_drop(false)`, its own process group (Unix `process_group(0)`, Windows `CREATE_NEW_PROCESS_GROUP`), stdio to null. When the daemon exits or restarts, the app-server keeps running and `codex --remote` windows stay attached; the next daemon re-adopts it after verifying health. This supersedes an earlier model that killed the app-server on daemon shutdown.
+**Detached lifetime (Codex-session continuity).** A spawned app-server is deliberately **not** bound to the daemon's lifetime: it is started detached — `kill_on_drop(false)` and its own process group (Unix `process_group(0)`, the verified path; Windows `CREATE_NEW_PROCESS_GROUP`, best-effort and not exercised in CI), stdio to null. On Unix, when the daemon exits or restarts the app-server keeps running and `codex --remote` windows stay attached; the next daemon re-adopts it after verifying health. This supersedes an earlier model that killed the app-server on daemon shutdown.
 
 **Backoff.** Two independent backoffs keep failure loops cheap:
 
-- *Respawn*, after the app-server exits or fails to start: `1s → 30s`, doubling, reset only after the server has stayed up for a stable window (30s) — an immediately-crashing binary never restarts at full speed forever.
+- *Respawn*, after the app-server exits or fails to start: `1s → 30s`, doubling, reset only after the endpoint has been **adopted and healthy** for a stable window (30s) — a binary that starts but never becomes adoptable, or crashes immediately, never resets it to full speed.
 - *Deep-verification retry*, for a Ready-but-unadoptable endpoint (foreign protocol, auth mismatch): a separate `5s → 60s` capped backoff, so `initialize` is not re-attempted on every poll. It resets on successful adoption or on any real shallow-state change — the endpoint going Absent or Occupied.
 
 **Authentication.** With `[codex].token_file` set, adoption requires **both** a successful authenticated `initialize` **and** that the endpoint refuses an unauthenticated client: an app-server that accepts no-token connections is rejected rather than adopted. Without a token file, any local process can drive the agent (the loopback trust posture); setting one is recommended even on loopback.
