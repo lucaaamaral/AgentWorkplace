@@ -183,8 +183,22 @@ async fn fake_app_server(behavior: FakeBehavior) -> (String, Arc<FakeStats>) {
                         "turn/steer" => {
                             stats.steers.fetch_add(1, AtOrd::SeqCst);
                             assert_eq!(
+                                v.pointer("/params/threadId").and_then(Value::as_str),
+                                Some("th-1")
+                            );
+                            assert_eq!(
                                 v.pointer("/params/expectedTurnId").and_then(Value::as_str),
                                 Some("host-turn")
+                            );
+                            assert_eq!(
+                                v.pointer("/params/input/0/type").and_then(Value::as_str),
+                                Some("text")
+                            );
+                            assert!(
+                                v.pointer("/params/input/0/text")
+                                    .and_then(Value::as_str)
+                                    .is_some_and(|text| text.contains("Bus message")),
+                                "steer input must carry the rendered bus delivery"
                             );
                             match behavior.steer_failure {
                                 SteerFailure::TransportDrop => return,
