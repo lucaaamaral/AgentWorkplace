@@ -61,9 +61,11 @@ broker = "127.0.0.1:9675"
 
 [codex]
 # Shared Codex app-server for `codex --remote` sessions. When set, the daemon
-# spawns and supervises `codex app-server --listen <this>` (restarted if it
-# dies, killed on shutdown) — the user never runs it. Omit to disable Codex
-# push delivery; plain `codex` sessions then participate outbound-only.
+# spawns and supervises `codex app-server --listen <this>` — the user never
+# runs it. The app-server is left running across daemon restarts and re-adopted
+# on the next start (see "Codex app-server supervision" below), so a broker
+# restart does not drop attached Codex sessions. Omit to disable Codex push
+# delivery; plain `codex` sessions then participate outbound-only.
 # app_server = "ws://127.0.0.1:9701"
 # Capability-token file for the shared app-server (recommended even on
 # loopback: any local process could otherwise drive the agent). The daemon
@@ -90,6 +92,29 @@ The broker's authorization model is deliberately thin and must be understood bef
 - **Set `[broker].auth_token` before adding any non-loopback `listen` address.** With a token set, `session/hello` is refused without it (`UNAUTHORIZED`), which gates every other verb. The token is a shared secret in the config file — machine-level protection, not per-principal identity.
 - The broker only ever dials **loopback `ws://` endpoints** as Codex app-servers, whatever a registration self-reports — a wire-supplied URL must not be able to point bus traffic at an arbitrary host.
 - Transport hygiene: inbound lines are length-capped (body limit + envelope slack), `jsonrpc: "2.0"` is enforced on requests, and malformed lines get spec `-32700` responses.
+
+## Codex app-server supervision
+
+When `[codex].app_server` is set, the daemon keeps a shared `codex app-server --listen <endpoint>` alive for `codex --remote` sessions to attach to. It supervises the **endpoint**, not merely a child it owns — which is what makes a broker restart zero-downtime for Codex.
+
+**State machine.** Roughly every two seconds the daemon runs a shallow readiness probe — a `GET /readyz` over TCP to the endpoint's host:port — and acts on the result:
+
+- **Ready** (`/readyz` → `200`) — if not already adopted, the daemon runs a **deep verification**: an authenticated `initialize` over the WebSocket (presenting the capability token when `token_file` is set) and, when a token is configured, a confirmation that the endpoint **rejects** an unauthenticated client. On success the endpoint is **adopted** and monitored by readyz thereafter; on failure it is treated as occupied and left alone — never spawned into.
+- **Absent** (nothing listening) — after a short debounce (two consecutive absent probes), the daemon **launches** `codex app-server --listen <endpoint>`, adding `--ws-auth capability-token --ws-token-file <file>` when `token_file` is set.
+- **Occupied** (listening but `/readyz` is non-200 or unresponsive) — the daemon **never spawns**; something already holds the endpoint. A server the daemon just spawned that is still starting logs as "spawned…not ready"; a genuinely foreign or unhealthy occupant logs as an error.
+
+The endpoint the daemon adopts may be one it spawned or one **left running by a previous daemon** — adopting either is what makes broker restarts transparent to attached Codex sessions.
+
+**Detached lifetime (zero-downtime).** A spawned app-server is deliberately **not** bound to the daemon's lifetime: it is started detached — `kill_on_drop(false)`, its own process group (Unix `process_group(0)`, Windows `CREATE_NEW_PROCESS_GROUP`), stdio to null. When the daemon exits or restarts, the app-server keeps running and `codex --remote` windows stay attached; the next daemon re-adopts it after verifying health. This supersedes an earlier model that killed the app-server on daemon shutdown.
+
+**Backoff.** Two independent backoffs keep failure loops cheap:
+
+- *Respawn*, after the app-server exits or fails to start: `1s → 30s`, doubling, reset only after the server has stayed up for a stable window (30s) — an immediately-crashing binary never restarts at full speed forever.
+- *Deep-verification retry*, for a Ready-but-unadoptable endpoint (foreign protocol, auth mismatch): a separate `5s → 60s` capped backoff, so `initialize` is not re-attempted on every poll. It resets on successful adoption or on any real shallow-state change — the endpoint going Absent or Occupied.
+
+**Authentication.** With `[codex].token_file` set, adoption requires **both** a successful authenticated `initialize` **and** that the endpoint refuses an unauthenticated client: an app-server that accepts no-token connections is rejected rather than adopted. Without a token file, any local process can drive the agent (the loopback trust posture); setting one is recommended even on loopback.
+
+**Stopping the app-server (deferred).** Because a spawned app-server survives daemon exit by design, workplace has **no owned command to stop it** — it tracks no PID for the app-server across restarts and writes no pidfile for it. Stopping a managed app-server is currently a manual operation (terminate the `codex app-server --listen <endpoint>` process). A workplace-owned stop is deferred.
 
 ## On-disk layout
 
