@@ -918,3 +918,148 @@ fn draw(
     })?;
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // C9 — characterization of the pure helpers before the R2 command
+    // extraction moves them.
+
+    #[test]
+    fn split_targets_positions() {
+        // Leading #/@ tokens are targets; the body starts at the first
+        // non-target token, position-tracked.
+        let (t, b) = split_targets("#a @b hello world");
+        assert_eq!(t, vec!["#a", "@b"]);
+        assert_eq!(b, "hello world");
+
+        // A repeated target must not confuse the body split.
+        let (t, b) = split_targets("#a #a #a done");
+        assert_eq!(t, vec!["#a", "#a", "#a"]);
+        assert_eq!(b, "done");
+
+        // Body containing target-like tokens is untouched.
+        let (t, b) = split_targets("#chan ping @someone about #topic");
+        assert_eq!(t, vec!["#chan"]);
+        assert_eq!(b, "ping @someone about #topic");
+
+        // No targets / empty input.
+        let (t, b) = split_targets("just words");
+        assert!(t.is_empty());
+        assert_eq!(b, "just words");
+        let (t, b) = split_targets("");
+        assert!(t.is_empty());
+        assert_eq!(b, "");
+
+        // Targets only, no body.
+        let (t, b) = split_targets("#a @b");
+        assert_eq!(t, vec!["#a", "@b"]);
+        assert_eq!(b, "");
+    }
+
+    #[test]
+    fn hhmmss_shape() {
+        // Local-time rendering: assert the stable shape, not the timezone.
+        let s = hhmmss(1_700_000_000_000);
+        assert_eq!(s.len(), 8);
+        assert_eq!(s.as_bytes()[2], b':');
+        assert_eq!(s.as_bytes()[5], b':');
+    }
+
+    fn envelope(channels: &[&str], principals: &[&str]) -> Envelope {
+        Envelope {
+            message_id: 42,
+            thread_id: 7,
+            timestamp: 0,
+            sender: "@a".into(),
+            recipients: Recipients {
+                channels: channels.iter().map(|s| s.to_string()).collect(),
+                principals: principals.iter().map(|s| s.to_string()).collect(),
+            },
+            body: "the body".into(),
+            truncated: false,
+        }
+    }
+
+    #[test]
+    fn format_record_channel_dm_and_intersection() {
+        let ch = format_record(&Record::Message {
+            envelope: envelope(&["#g"], &[]),
+        });
+        assert!(ch.contains("[#g]") && ch.contains("@a") && ch.contains("the body"));
+        assert!(ch.contains("msg 42") && ch.contains("thread 7"));
+
+        let dm = format_record(&Record::Message {
+            envelope: envelope(&[], &["@b"]),
+        });
+        assert!(dm.contains("dm:@b"));
+
+        let both = format_record(&Record::Message {
+            envelope: envelope(&["#g"], &["@b"]),
+        });
+        assert!(both.contains("[#g]") && both.contains("@ @b"));
+    }
+
+    #[test]
+    fn format_system_events() {
+        let s = format_system(&SystemEvent::Registered {
+            principal: "@a".into(),
+            admin: true,
+        });
+        assert!(s.contains("@a") && s.contains("(admin)"));
+
+        let s = format_system(&SystemEvent::Unsubscribed {
+            principal: "@a".into(),
+            channel: "#g".into(),
+            by_admin: true,
+        });
+        assert!(s.contains("(by admin)"));
+
+        let s = format_system(&SystemEvent::ChannelDeleted {
+            channel_id: 1,
+            name: "#gone".into(),
+            record_count: 3,
+            by: "@m".into(),
+        });
+        assert!(s.contains("PERMANENTLY DELETED") && s.contains("#gone") && s.contains("3"));
+    }
+
+    #[test]
+    fn format_event_ack_line() {
+        let s = format_event(&WatchEvent::Ack(AckTransition {
+            kind: "ack".into(),
+            message_id: 9,
+            recipient: "@r".into(),
+            state: AckState::Failed,
+            timestamp: 0,
+            reason: Some("disconnected".into()),
+        }));
+        assert!(s.contains("msg 9") && s.contains("@r") && s.contains("(disconnected)"));
+    }
+
+    #[test]
+    fn command_completion() {
+        let addr: SocketAddr = "127.0.0.1:1".parse().unwrap();
+
+        // Unique prefix completes with a trailing space.
+        let mut app = App::new(addr, "@m".into());
+        app.input = "/wh".into();
+        complete_command(&mut app);
+        assert_eq!(app.input, "/who ");
+
+        // Ambiguous prefix lists candidates without changing the input.
+        let mut app = App::new(addr, "@m".into());
+        app.input = "/un".into();
+        complete_command(&mut app);
+        assert_eq!(app.input, "/un");
+        assert!(app.lines.last().unwrap().contains("/unsub"));
+        assert!(app.lines.last().unwrap().contains("/unarchive"));
+
+        // Non-command input is untouched.
+        let mut app = App::new(addr, "@m".into());
+        app.input = "plain text".into();
+        complete_command(&mut app);
+        assert_eq!(app.input, "plain text");
+    }
+}
