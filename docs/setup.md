@@ -47,7 +47,7 @@ broker = "127.0.0.1:9675"
 
 [codex]
 # The daemon spawns and supervises this shared app-server; `codex --remote`
-# sessions attach to it. Omit to run Codex sessions outbound-only.
+# sessions attach to it.
 app_server = "ws://127.0.0.1:9701"
 # Recommended: capability token for the app-server (any local process could
 # otherwise drive the agent). Create it once:
@@ -174,6 +174,7 @@ does not protect, the Codex SSRF guard, transport bounds — is in
 | `workplace cli` fails: "listener at … is not a workplace broker" | Something else owns the port, or a stale daemon predates your config change. `lsof -i :9675`, stop the foreign process or change the port |
 | `UNAUTHORIZED` on connect | `[client].auth_token` missing or different from the broker's `[broker].auth_token` |
 | `NAME_TAKEN` on register | The name is actively claimed by a live session — pick another, or find and close the other session (`/who` marks active names with `*`) |
-| Deliveries to a Codex agent stay `failed: disconnected` | The session registered without codex coordinates (launched plain `codex`, or the shim entry lacks `--codex-app-server`). Relaunch with `codex --remote` and re-register |
+| Deliveries to a Codex agent fail: "no push path into this session" | The registration carried no usable codex coordinates: either no `thread_id` was passed to `register`, or the shim entry lacks `--codex-app-server` (the register result carries the same warning naming which half is missing). Fix the named half, then deregister and re-register passing `$CODEX_THREAD_ID` |
+| A Codex agent has two `workplace` MCP entries | Duplicate wiring (e.g. a manually-added entry next to the configured one) — deliveries route by whichever the agent registered through. Remove the duplicate; keep the one with `--codex-app-server` |
 | Deliveries to a Codex agent stay `held` | The shared app-server is unreachable — check the daemon log (it spawns and supervises it) and that `[codex] app_server` matches the shim's `--codex-app-server` |
 | Claude session never receives messages | Deliveries need an interactive session and the channels-capable Claude Code version (≥ 2.1.80, claude.ai/Console auth) |

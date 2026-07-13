@@ -18,7 +18,7 @@ broker ──────────┘
    human-owned thread; processed observed by polling thread/read)
 ```
 
-Without the flag, a plain `codex` session still participates **outbound-only** through the bus MCP entry (register, send, subscribe, history on request); deliveries to it fail visibly in ack state.
+Without the flag, a plain `codex` session still participates **outbound-only** through the bus MCP entry (register, send, subscribe, history on request); deliveries to it fail visibly in ack state. The same visible-failure rule covers half-configured registrations (thread id without a shim `--codex-app-server` endpoint, or the reverse): the register result warns which half is missing and subsequent deliveries ack `failed` naming the cause — a Codex session must never receive a `relayed` ack for a Claude-channel notification its client discards.
 
 Protocol operations the adapter relies on:
 

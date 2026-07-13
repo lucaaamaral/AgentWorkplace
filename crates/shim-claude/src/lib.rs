@@ -51,24 +51,34 @@ pub struct ShimConfig {
 }
 
 pub async fn run(cfg: ShimConfig) -> anyhow::Result<()> {
-    // stdout writer: the only thing allowed to touch stdout (MCP protocol).
+    run_with_io(cfg, tokio::io::stdin(), tokio::io::stdout()).await
+}
+
+/// `run` with injectable stdio (tests drive the MCP side through in-memory
+/// pipes; production passes the real stdin/stdout).
+pub async fn run_with_io<R, W>(cfg: ShimConfig, input: R, output: W) -> anyhow::Result<()>
+where
+    R: tokio::io::AsyncRead + Unpin,
+    W: tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    // Output writer: the only thing allowed to touch the MCP output stream.
     let (mcp_tx, mut mcp_rx) = mpsc::unbounded_channel::<Value>();
     let stdout_task = tokio::spawn(async move {
-        let mut stdout = tokio::io::stdout();
+        let mut output = output;
         while let Some(v) = mcp_rx.recv().await {
             let mut line = v.to_string();
             line.push('\n');
-            if stdout.write_all(line.as_bytes()).await.is_err() {
+            if output.write_all(line.as_bytes()).await.is_err() {
                 break;
             }
-            let _ = stdout.flush().await;
+            let _ = output.flush().await;
         }
     });
 
     let broker = BrokerLink::spawn(cfg, mcp_tx.clone());
 
-    // stdin loop: MCP requests from Claude Code.
-    let mut lines = BufReader::new(tokio::io::stdin()).lines();
+    // Input loop: MCP requests from the harness.
+    let mut lines = BufReader::new(input).lines();
     while let Ok(Some(line)) = lines.next_line().await {
         if line.trim().is_empty() {
             continue;
@@ -151,6 +161,11 @@ struct BrokerLink {
     calls: mpsc::UnboundedSender<Call>,
     version: Arc<String>,
     codex_app_server: Arc<Option<String>>,
+    /// Set when the active registration has no working push path (a Codex
+    /// registration whose coordinates could not be attached). Deliveries then
+    /// FAIL with this reason instead of acking a `relayed` the harness would
+    /// silently discard (message model: never silent loss).
+    delivery_block: Arc<std::sync::Mutex<Option<String>>>,
 }
 
 impl BrokerLink {
@@ -162,11 +177,14 @@ impl BrokerLink {
         let (calls_tx, calls_rx) = mpsc::unbounded_channel::<Call>();
         let version = Arc::new(cfg.version.clone());
         let codex_app_server = Arc::new(cfg.codex_app_server.clone());
-        tokio::spawn(broker_loop(cfg, mcp_tx, calls_rx));
+        let delivery_block: Arc<std::sync::Mutex<Option<String>>> =
+            Arc::new(std::sync::Mutex::new(None));
+        tokio::spawn(broker_loop(cfg, mcp_tx, calls_rx, delivery_block.clone()));
         BrokerLink {
             calls: calls_tx,
             version,
             codex_app_server,
+            delivery_block,
         }
     }
 
@@ -199,6 +217,7 @@ async fn broker_loop(
     cfg: ShimConfig,
     mcp_tx: mpsc::UnboundedSender<Value>,
     mut calls_rx: mpsc::UnboundedReceiver<Call>,
+    delivery_block: Arc<std::sync::Mutex<Option<String>>>,
 ) {
     // The full register params this shim carries across reconnects (name +
     // optional codex coordinates).
@@ -227,7 +246,16 @@ async fn broker_loop(
             }
         };
         let connected_at = tokio::time::Instant::now();
-        if let Err(e) = connected_loop(&cfg, stream, &mcp_tx, &mut calls_rx, &mut binding).await {
+        if let Err(e) = connected_loop(
+            &cfg,
+            stream,
+            &mcp_tx,
+            &mut calls_rx,
+            &mut binding,
+            &delivery_block,
+        )
+        .await
+        {
             tracing::warn!("broker connection lost: {e}");
         }
         if connected_at.elapsed() >= STABLE_CONNECTION {
@@ -271,6 +299,7 @@ async fn connected_loop(
     mcp_tx: &mpsc::UnboundedSender<Value>,
     calls_rx: &mut mpsc::UnboundedReceiver<Call>,
     binding: &mut Option<Value>,
+    delivery_block: &Arc<std::sync::Mutex<Option<String>>>,
 ) -> anyhow::Result<()> {
     let (read_half, mut write_half) = stream.into_split();
     let mut lines = BufReader::new(read_half).lines();
@@ -337,7 +366,7 @@ async fn connected_loop(
                     Ok(Message::Request(req)) => {
                         // Broker-originated request: delivery.
                         if req.method == m::MESSAGE_DELIVER {
-                            let resp = handle_deliver(mcp_tx, req.params.unwrap_or(Value::Null));
+                            let resp = handle_deliver(mcp_tx, req.params.unwrap_or(Value::Null), delivery_block);
                             let msg = match resp {
                                 Ok(v) => protocol::ok_response(req.id, v),
                                 Err(e) => protocol::err_response(req.id, e),
@@ -401,8 +430,22 @@ fn response_to_result(resp: Response) -> Result<Value, RpcError> {
 }
 
 /// Translate a broker delivery into a Claude Code channel event (CL-1) and
-/// acknowledge relayed once it is on the session's stdio (CL-2).
-fn handle_deliver(mcp_tx: &mpsc::UnboundedSender<Value>, params: Value) -> Result<Value, RpcError> {
+/// acknowledge relayed once it is on the session's stdio (CL-2). When the
+/// active registration has no push path (delivery_block set), FAIL instead:
+/// a `relayed` ack for a notification the harness will discard is silent
+/// loss dressed as success.
+fn handle_deliver(
+    mcp_tx: &mpsc::UnboundedSender<Value>,
+    params: Value,
+    delivery_block: &Arc<std::sync::Mutex<Option<String>>>,
+) -> Result<Value, RpcError> {
+    if let Some(reason) = delivery_block.lock().unwrap().clone() {
+        return Err(RpcError {
+            code: -32012,
+            message: reason,
+            data: None,
+        });
+    }
     let p: DeliverParams = serde_json::from_value(params).map_err(|e| RpcError {
         code: -32602,
         message: format!("bad deliver params: {e}"),
@@ -517,16 +560,53 @@ async fn handle_tool_call(broker: &BrokerLink, params: &Value) -> Value {
         "register" => {
             // A Codex agent self-reports its thread id (findings.md); the
             // shim contributes the app-server endpoint from its own config.
+            // Coordinates attach only when BOTH halves are present — any
+            // half-configured registration has no push path, which must be
+            // loud (warning now, failed acks later), never silent.
+            let thread_id = args.get("thread_id").and_then(Value::as_str);
+            let app_server = broker.codex_app_server.as_ref().as_deref();
             let mut params = json!({ "name": args.get("name") });
-            if let (Some(thread_id), Some(app_server)) = (
-                args.get("thread_id").and_then(Value::as_str),
-                broker.codex_app_server.as_ref().as_deref(),
-            ) {
-                params["codex"] = json!({ "app_server": app_server, "thread_id": thread_id });
+            let no_push_path = match (thread_id, app_server) {
+                (Some(thread_id), Some(app_server)) => {
+                    params["codex"] = json!({ "app_server": app_server, "thread_id": thread_id });
+                    None
+                }
+                (Some(_), None) => Some(
+                    "thread_id was IGNORED: this shim was launched without --codex-app-server, \
+                     so the bus has no push path into this session and deliveries to this \
+                     principal will FAIL. Fix the [mcp_servers.workplace] entry to add \
+                     --codex-app-server <ws endpoint>, restart the session, and re-register.",
+                ),
+                (None, Some(_)) => Some(
+                    "no thread_id was provided: this shim serves Codex sessions \
+                     (--codex-app-server is configured), so the bus has no push path into this \
+                     session and deliveries to this principal will FAIL. Run `echo \
+                     $CODEX_THREAD_ID`, then deregister and re-register passing it as thread_id.",
+                ),
+                (None, None) => None,
+            };
+            let result = broker.call(m::PRINCIPAL_REGISTER, params).await;
+            if result.is_ok() {
+                *broker.delivery_block.lock().unwrap() = no_push_path.map(String::from);
             }
-            broker.call(m::PRINCIPAL_REGISTER, params).await
+            return match result {
+                Ok(v) => {
+                    let text = match no_push_path {
+                        Some(w) => format!("{v}\nWARNING: {w}"),
+                        None => v.to_string(),
+                    };
+                    json!({ "content": [{ "type": "text", "text": text }] })
+                }
+                Err(e) => tool_error(&e.message),
+            };
         }
-        "deregister" => broker.call(m::PRINCIPAL_DEREGISTER, json!({})).await,
+        "deregister" => {
+            let result = broker.call(m::PRINCIPAL_DEREGISTER, json!({})).await;
+            if result.is_ok() {
+                *broker.delivery_block.lock().unwrap() = None;
+            }
+            result
+        }
         "send" => broker.call(m::MESSAGE_SEND, args).await,
         "subscribe" => broker.call(m::CHANNEL_SUBSCRIBE, args).await,
         "unsubscribe" => broker.call(m::CHANNEL_UNSUBSCRIBE, args).await,
