@@ -49,6 +49,13 @@ const MAX_WS_MESSAGE: usize = 16 * 1024 * 1024;
 
 type Pending = Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Value, CallError>>>>>;
 
+enum ThreadState {
+    Idle,
+    /// Active/system-busy thread; the id is present when thread/read exposes
+    /// an in-progress turn that can be used as turn/steer's precondition.
+    Busy(Option<String>),
+}
+
 /// A non-owner client attached to a shared `codex app-server --listen`.
 pub struct CodexAttach {
     out: mpsc::UnboundedSender<WsMessage>,
@@ -207,22 +214,38 @@ impl CodexAttach {
             .map(|_| ())
     }
 
-    /// Read the thread's idle/active status. `thread/read` errors before the
-    /// thread's first user message ("not materialized yet") — treated as idle.
-    async fn thread_idle(&self, thread_id: &str) -> Result<bool, CallError> {
+    /// Read thread status and, while active, the in-progress turn id required
+    /// by turn/steer. `thread/read` errors before the first user message
+    /// ("not materialized yet") — treated as idle.
+    async fn thread_state(&self, thread_id: &str) -> Result<ThreadState, CallError> {
         match self
             .call(
                 "thread/read",
-                json!({ "threadId": thread_id, "includeTurns": false }),
+                json!({ "threadId": thread_id, "includeTurns": true }),
             )
             .await
         {
-            Ok(v) => Ok(v
-                .pointer("/thread/status/type")
-                .and_then(Value::as_str)
-                .map(|t| t == "idle")
-                .unwrap_or(true)),
-            Err(CallError::Rpc(e)) if e.contains("not materialized") => Ok(true),
+            Ok(v) => {
+                let status = v
+                    .pointer("/thread/status/type")
+                    .and_then(Value::as_str)
+                    .unwrap_or("idle");
+                if status == "idle" {
+                    return Ok(ThreadState::Idle);
+                }
+                let active_turn = v
+                    .pointer("/thread/turns")
+                    .and_then(Value::as_array)
+                    .and_then(|turns| {
+                        turns.iter().rev().find_map(|turn| {
+                            (turn.get("status").and_then(Value::as_str) == Some("inProgress"))
+                                .then(|| turn.get("id").and_then(Value::as_str).map(String::from))
+                                .flatten()
+                        })
+                    });
+                Ok(ThreadState::Busy(active_turn))
+            }
+            Err(CallError::Rpc(e)) if e.contains("not materialized") => Ok(ThreadState::Idle),
             Err(e) => Err(e),
         }
     }
@@ -254,26 +277,118 @@ impl CodexAttach {
         }
     }
 
-    /// Deliver one rendered message into the (human-owned) thread. Serialized
-    /// on idle per thread (turn/start while busy is silently dropped, CX-2);
-    /// `processed` is observed by polling this turn's status. An unloaded
-    /// thread is resumed transparently (CX-8) — once — before giving up.
+    /// Deliver one rendered message into the human-owned thread. Idle threads
+    /// get a fresh turn/start; active steerable turns get turn/steer so a bus
+    /// message reaches Codex immediately. A steer RPC rejection is definitive
+    /// non-delivery and safely falls back to turn/start once idle. Processing
+    /// is observed by polling the turn that included the message.
     pub async fn deliver(&self, thread_id: &str, text: &str) -> Delivered {
         let lock = self.thread_lock(thread_id);
         let _guard = lock.lock().await;
 
-        // Wait for idle: the human may be mid-turn — their session, their
-        // priority. The broker holds; we poll.
         let mut resumed = false;
+        let mut steer_refused = false;
         let deadline = tokio::time::Instant::now() + TURN_TIMEOUT;
-        loop {
-            match self.thread_idle(thread_id).await {
-                Ok(true) => break,
-                Ok(false) => {
+        let (turn_id, mode) = loop {
+            match self.thread_state(thread_id).await {
+                Ok(ThreadState::Busy(Some(active_turn))) if !steer_refused => {
+                    // COMMIT POINT, same discipline as turn/start: after the
+                    // steer request is sent, a transport loss is ambiguous and
+                    // retrying could inject the bus message twice.
+                    match self
+                        .call(
+                            "turn/steer",
+                            json!({
+                                "threadId": thread_id,
+                                "expectedTurnId": active_turn,
+                                "input": [{ "type": "text", "text": text }],
+                            }),
+                        )
+                        .await
+                    {
+                        Ok(v) => match v.get("turnId").and_then(Value::as_str) {
+                            Some(id) => {
+                                tracing::info!(
+                                    thread_id,
+                                    turn_id = id,
+                                    "bus delivery steered into active turn"
+                                );
+                                break (id.to_string(), "turn/steer");
+                            }
+                            None => {
+                                return Delivered::Failed("turn/steer returned no turn id".into());
+                            }
+                        },
+                        Err(CallError::Transport(e)) => {
+                            return Delivered::Failed(format!(
+                                "transport failure during turn/steer; completion unknown: {e}"
+                            ));
+                        }
+                        Err(CallError::Rpc(e)) => {
+                            // The host turn may have completed between read and
+                            // steer, or it may be a non-steerable review/compact
+                            // turn. The response proves nothing was injected;
+                            // wait for idle and use a fresh turn exactly once.
+                            tracing::debug!(
+                                thread_id,
+                                error = e,
+                                "turn/steer rejected; falling back to turn/start on idle"
+                            );
+                            steer_refused = true;
+                        }
+                    }
+                }
+                Ok(ThreadState::Busy(_)) => {
                     if tokio::time::Instant::now() > deadline {
                         return Delivered::Failed("thread stayed busy past timeout".into());
                     }
                     tokio::time::sleep(POLL_INTERVAL).await;
+                }
+                Ok(ThreadState::Idle) => {
+                    // turn/start while busy is accepted but dropped by the app
+                    // server; it is used only after an idle read.
+                    match self
+                        .call(
+                            "turn/start",
+                            json!({ "threadId": thread_id, "input": [{ "type": "text", "text": text }] }),
+                        )
+                        .await
+                    {
+                        Ok(v) => match v.pointer("/turn/id").and_then(Value::as_str) {
+                            Some(id) => break (id.to_string(), "turn/start"),
+                            None => {
+                                return Delivered::Failed(
+                                    "turn/start returned no turn id".into(),
+                                );
+                            }
+                        },
+                        Err(CallError::Transport(e)) => {
+                            return Delivered::Failed(format!(
+                                "transport failure during turn/start; completion unknown: {e}"
+                            ));
+                        }
+                        Err(CallError::Rpc(e)) => {
+                            if thread_gone(&e) {
+                                return Delivered::Failed(format!("thread gone: {e}"));
+                            }
+                            if resumed || !unload_hint(&e) {
+                                return Delivered::Failed(e);
+                            }
+                            resumed = true;
+                            match self.resume_thread(thread_id).await {
+                                Ok(()) => continue,
+                                Err(CallError::Transport(t)) => {
+                                    return Delivered::Failed(format!(
+                                        "transport failure during resume after turn/start attempt; \
+                                         completion unknown: {t}"
+                                    ));
+                                }
+                                Err(CallError::Rpc(r)) => {
+                                    return Delivered::Failed(format!("thread gone: {r}"));
+                                }
+                            }
+                        }
+                    }
                 }
                 Err(CallError::Transport(e)) => return Delivered::Unreachable(e),
                 Err(CallError::Rpc(e)) => {
@@ -297,53 +412,6 @@ impl CodexAttach {
                     }
                 }
             }
-        }
-
-        // COMMIT POINT: once turn/start has been sent, a lost response no
-        // longer proves the turn did not run — so any TRANSPORT failure from
-        // here on is terminal ("completion unknown"), never Unreachable/
-        // retriable. An RPC *error response* is different: the server
-        // answered, the turn definitively did not start, so the unload-resume
-        // retry stays safe.
-        let turn_id = loop {
-            match self
-                .call(
-                    "turn/start",
-                    json!({ "threadId": thread_id, "input": [{ "type": "text", "text": text }] }),
-                )
-                .await
-            {
-                Ok(v) => match v.pointer("/turn/id").and_then(Value::as_str) {
-                    Some(id) => break id.to_string(),
-                    None => return Delivered::Failed("turn/start returned no turn id".into()),
-                },
-                Err(CallError::Transport(e)) => {
-                    return Delivered::Failed(format!(
-                        "transport failure during turn/start; completion unknown: {e}"
-                    ));
-                }
-                Err(CallError::Rpc(e)) => {
-                    if thread_gone(&e) {
-                        return Delivered::Failed(format!("thread gone: {e}"));
-                    }
-                    if resumed || !unload_hint(&e) {
-                        return Delivered::Failed(e);
-                    }
-                    resumed = true;
-                    match self.resume_thread(thread_id).await {
-                        Ok(()) => continue,
-                        Err(CallError::Transport(t)) => {
-                            return Delivered::Failed(format!(
-                                "transport failure during resume after turn/start attempt; \
-                                 completion unknown: {t}"
-                            ));
-                        }
-                        Err(CallError::Rpc(r)) => {
-                            return Delivered::Failed(format!("thread gone: {r}"));
-                        }
-                    }
-                }
-            }
         };
 
         // Poll for this turn's completion (the processed ack). A transport
@@ -355,13 +423,15 @@ impl CodexAttach {
             tokio::time::sleep(POLL_INTERVAL).await;
             match self.turn_status(thread_id, &turn_id).await {
                 Ok(Some(status)) if status == "completed" => return Delivered::Processed,
-                Ok(Some(status)) if status == "failed" || status == "error" => {
+                Ok(Some(status))
+                    if status == "failed" || status == "error" || status == "interrupted" =>
+                {
                     return Delivered::Failed(format!("turn ended with status {status}"));
                 }
                 Ok(_) => {}
                 Err(CallError::Transport(e)) => {
                     return Delivered::Failed(format!(
-                        "app-server connection lost after turn/start; completion unknown: {e}"
+                        "app-server connection lost after {mode}; completion unknown: {e}"
                     ));
                 }
                 Err(CallError::Rpc(e)) => return Delivered::Failed(format!("poll failed: {e}")),

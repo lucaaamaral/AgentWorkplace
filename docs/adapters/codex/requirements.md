@@ -26,7 +26,7 @@ Protocol operations the adapter relies on:
 | --- | --- |
 | `thread/start`, `thread/resume` | Create/reattach the agent's persistent thread |
 | `turn/start` | Deliver a bus message as a new user turn (primary delivery path) |
-| `turn/steer` | Inject guidance into a turn already in progress, without interrupting |
+| `turn/steer` | Deliver a bus message into a turn already in progress (busy-thread delivery, manager-accepted blending); also usable for guidance without interrupting |
 | `turn/interrupt` | Cancel the current turn (human emergency stop) |
 | `thread/inject_items` | Append context items to model-visible history without starting a turn |
 | `thread/read`, `thread/list` | Recover history/thread ids after restarts |
@@ -36,9 +36,9 @@ Protocol operations the adapter relies on:
 
 ### Inbound (broker → session)
 
-- CX-1. Deliver a message via `turn/start` on the agent's thread, formatted so the event identifies the bus channel, the sender, the body, and how to reply through the bus tools.
-- CX-2. Delivery must serialize on the thread: `turn/start` while a turn is in progress is accepted but the turn never runs ([findings](findings.md)). The adapter waits for the thread to be idle (`turn/completed` / `thread/status: idle`) before `turn/start`; it never fires while busy. All holding is the broker's — the protocol does not queue.
-- CX-3. Ack mapping: `turn/start` accepted → `delivered`; `turn/completed` for that turn → `processed`.
+- CX-1. Deliver a message via the state-dependent primitive on the agent's thread (CX-2: idle → `turn/start`, busy → `turn/steer`), formatted so the event identifies the bus channel, the sender, the body, and how to reply through the bus tools.
+- CX-2. Delivery serializes per thread, and the primitive depends on the thread's state at delivery time: **idle → `turn/start`** (firing it while busy silently loses the message — [findings](findings.md)); **busy → `turn/steer`** into the active turn (`expectedTurnId` from `thread/read`), a manager-directed choice (2026-07-12) that accepts the steered message blending into the running turn's reply — see the superseded decision in [findings](findings.md). The steer completion race ("no active turn") falls back to re-read → `turn/start`; `turn/start` is still never fired while busy. Any remaining holding is the broker's — the protocol does not queue.
+- CX-3. Ack mapping: `turn/start` or `turn/steer` accepted → `relayed`; completion of the delivering turn → `processed` (for a steered delivery that is the **host** turn — honest under the message model's "completed a turn that included the message", and the weakest-claim reading of a blended turn).
 - CX-4. `thread/inject_items` may be used for context drops that should not trigger a reaction. Use sparingly — injected items bypass the agent's explicit attention.
 - CX-5. If the app-server is unreachable while the session is still present (MCP-entry connection alive), recipients are `held`; the adapter reconnects, resumes the thread (`thread/resume`), and drains. If the session itself is disconnected, deliveries fail per the message model — no store-and-forward.
 
@@ -71,7 +71,7 @@ See also: [spike findings](findings.md).
 ## Risks / open questions
 
 - **TUI + injected turns UX.** The TUI renders turns the adapter started. Verify the human can distinguish bus-initiated turns from their own prompts (delivery formatting should make the source explicit). Not yet tested — the spike used single-client stdio, not a WebSocket TUI sharing the thread.
-- **`turn/steer` not adopted for delivery (settled).** Edge-case testing ([findings](findings.md)) showed steering an unrelated message into a running turn blends it into the agent's current work (no clean thread/attribution), and steering races turn completion. Delivery therefore stays `turn/start` serialized on idle (CX-2); `turn/steer` is reserved for a possible future override/interrupt class where derailing the current turn is the intent.
+- **`turn/steer` adopted for busy-thread delivery (manager-directed, 2026-07-12 — supersedes the earlier settled rejection).** Edge-case testing ([findings](findings.md)) showed steering an unrelated message into a running turn blends it into the agent's current work with no clean thread/attribution; the manager chose immediate active-turn arrival with that cost explicit. The race and transport rules live in CX-2 and the findings supersession note; the ack remains honest — `processed` still means "the harness completed a turn that included the message", which for a steered delivery is the host turn.
 - **Delivery-path discovery at registration (settled).** The initiative is the harness's: registration arrives through the session's bus MCP entry, and must carry the delivery path the adapter records — app-server endpoint and thread id (CX-7). The MCP entry contributes the endpoint from the config it is launched with; the thread id is self-reported by the agent from `$CODEX_THREAD_ID` ([findings](findings.md) — `thread/list` is connection-scoped and cannot discover it). One app-server per agent vs one shared app-server with many threads is a deployment choice the adapter is agnostic to — it dials whatever registration reports, **constrained to loopback `ws://` endpoints** (the value arrives over the wire; a non-loopback URL is rejected at registration).
 
 ## References
