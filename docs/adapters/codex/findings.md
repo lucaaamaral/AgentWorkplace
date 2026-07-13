@@ -30,7 +30,9 @@ A dedicated edge-case pass (`spike4.mjs`) on 0.144.1 evaluated both as delivery 
 - **Heavy config surface.** The params mirror `thread/start` (`model`, `sandbox`, `approvalPolicy`, `cwd`, …). Passing `threadId` alone restores from the persisted rollout; partial overrides would silently change the agent's model/sandbox — so resume with `threadId` only (or the recorded config), never partial.
 - **`turn/start` after resume works** — resume→`turn/start` is the reattach-then-deliver sequence for unloaded threads (CX-8).
 
-**Decision:** delivery is `turn/start` only, serialized on thread-idle; `thread/resume` (threadId-only) precedes it when the thread has unloaded. `turn/steer` is **not adopted for delivery** (conflation + completion race) — reserved for a possible future override/interrupt class. This closes the "turn/steer usefulness" open question in the [requirements](requirements.md).
+**Decision (original):** delivery is `turn/start` only, serialized on thread-idle; `thread/resume` (threadId-only) precedes it when the thread has unloaded. `turn/steer` was **not adopted for delivery** (conflation + completion race) — reserved for a possible future override/interrupt class.
+
+**Superseded — manager-directed (2026-07-12):** immediate arrival during active turns outweighs attribution. Delivery to a **busy** thread now uses `turn/steer` (`threadId` + `expectedTurnId` + `input`), explicitly accepting the observed conflation: the steered message blends into the running turn's work with no separate reply boundary — that cost falls on the manager reading the window, and the manager chose it. Everything else stands: idle delivery remains `turn/start` (steer is never attempted on an idle thread — it errors); the completion race falls back to re-read → `turn/start`; transport loss at or after a sent steer is terminal completion-unknown, same commit-point discipline as `turn/start`. The empirical findings above are unchanged — the conflation is real and *accepted*, not refuted.
 
 ## Corrected assumptions
 
