@@ -313,6 +313,48 @@ mod tests {
     use super::*;
 
     #[test]
+    fn size_parser_accepts_supported_units_and_rejects_bad_values() {
+        assert_eq!(parse_size("8MB").unwrap(), 8 * 1024 * 1024);
+        assert_eq!(parse_size(" 512 kb ").unwrap(), 512 * 1024);
+        assert_eq!(parse_size("1GB").unwrap(), 1024 * 1024 * 1024);
+        assert_eq!(parse_size("42B").unwrap(), 42);
+        assert_eq!(parse_size("1048576").unwrap(), 1_048_576);
+        assert!(parse_size("").is_err());
+        assert!(parse_size("12XB").is_err());
+        assert!(parse_size("-1KB").is_err());
+    }
+
+    #[test]
+    fn endpoint_parser_applies_default_port_and_preserves_explicit_ports() {
+        let defaulted = parse_endpoint("127.0.0.1").unwrap();
+        assert_eq!(
+            defaulted.ip(),
+            "127.0.0.1".parse::<std::net::IpAddr>().unwrap()
+        );
+        assert_eq!(defaulted.port(), protocol::DEFAULT_PORT);
+
+        let explicit = parse_endpoint("127.0.0.1:1234").unwrap();
+        assert_eq!(explicit.port(), 1234);
+
+        let ipv6 = parse_endpoint("[::1]:4321").unwrap();
+        assert_eq!(ipv6.ip(), "::1".parse::<std::net::IpAddr>().unwrap());
+        assert_eq!(ipv6.port(), 4321);
+        assert!(parse_endpoint("not an endpoint").is_err());
+    }
+
+    #[test]
+    fn local_endpoint_classification_covers_both_ip_families() {
+        for local in ["127.0.0.1:1", "0.0.0.0:1", "[::1]:1", "[::]:1"] {
+            let addr: SocketAddr = local.parse().unwrap();
+            assert!(endpoint_is_local(&addr), "{addr} should be local");
+        }
+        for remote in ["192.0.2.1:1", "[2001:db8::1]:1"] {
+            let addr: SocketAddr = remote.parse().unwrap();
+            assert!(!endpoint_is_local(&addr), "{addr} should not be local");
+        }
+    }
+
+    #[test]
     fn admin_token_lifecycle() {
         let dir = std::env::temp_dir().join(format!("workplace-admin-tok-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
