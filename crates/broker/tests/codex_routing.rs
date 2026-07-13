@@ -35,6 +35,16 @@ struct FakeBehavior {
     /// thread/read and turn/start error with a not-loaded hint until the
     /// client has called thread/resume (CX-8).
     require_resume: bool,
+    /// thread/read initially reports idle, but turn/start observes that the
+    /// thread unloaded in the intervening race window.
+    unload_at_turn_start: bool,
+    /// Return successful turn/start or turn/steer responses without the
+    /// required turn identifier.
+    omit_start_turn_id: bool,
+    omit_steer_turn_id: bool,
+    /// Once a delivery has been injected, make the completion poll fail with
+    /// an RPC error.
+    poll_rpc_error: bool,
     /// Every thread call errors "no rollout found" — the thread is gone
     /// entirely (terminal, must NOT trigger a resume).
     gone: bool,
@@ -164,7 +174,9 @@ async fn fake_app_server(behavior: FakeBehavior) -> (String, Arc<FakeStats>) {
                                 }
                                 continue;
                             }
-                            if behavior.require_resume && !resumed {
+                            if (behavior.require_resume || behavior.unload_at_turn_start)
+                                && !resumed
+                            {
                                 let resp = json!({ "jsonrpc": "2.0", "id": id, "error": {
                                     "code": -32600, "message": "thread th-1 is not loaded" } });
                                 if sink
@@ -178,7 +190,11 @@ async fn fake_app_server(behavior: FakeBehavior) -> (String, Arc<FakeStats>) {
                             }
                             turn_started = true;
                             stats.turns_started.fetch_add(1, AtOrd::SeqCst);
-                            json!({ "turn": { "id": "turn-1", "status": "inProgress" } })
+                            if behavior.omit_start_turn_id {
+                                json!({ "turn": { "status": "inProgress" } })
+                            } else {
+                                json!({ "turn": { "id": "turn-1", "status": "inProgress" } })
+                            }
                         }
                         "turn/steer" => {
                             stats.steers.fetch_add(1, AtOrd::SeqCst);
@@ -224,7 +240,11 @@ async fn fake_app_server(behavior: FakeBehavior) -> (String, Arc<FakeStats>) {
                                 }
                                 SteerFailure::None => {
                                     steered = true;
-                                    json!({ "turnId": "host-turn" })
+                                    if behavior.omit_steer_turn_id {
+                                        json!({})
+                                    } else {
+                                        json!({ "turnId": "host-turn" })
+                                    }
                                 }
                             }
                         }
@@ -244,6 +264,18 @@ async fn fake_app_server(behavior: FakeBehavior) -> (String, Arc<FakeStats>) {
                             if behavior.require_resume && !resumed {
                                 let resp = json!({ "jsonrpc": "2.0", "id": id, "error": {
                                     "code": -32600, "message": "thread th-1 is not loaded" } });
+                                if sink
+                                    .send(WsMessage::Text(resp.to_string().into()))
+                                    .await
+                                    .is_err()
+                                {
+                                    return;
+                                }
+                                continue;
+                            }
+                            if behavior.poll_rpc_error && (turn_started || steered) {
+                                let resp = json!({ "jsonrpc": "2.0", "id": id, "error": {
+                                    "code": -32603, "message": "completion poll failed" } });
                                 if sink
                                     .send(WsMessage::Text(resp.to_string().into()))
                                     .await
@@ -476,6 +508,14 @@ async fn wait_for_ack(
     None
 }
 
+async fn wait_for_failed_reason(admin: &mut Client, message_id: u64, context: &str) -> String {
+    wait_for_ack(admin, message_id, "@codex-1", AckState::Failed, 120)
+        .await
+        .unwrap_or_else(|| panic!("{context}"))
+        .reason
+        .unwrap_or_default()
+}
+
 #[tokio::test]
 async fn codex_registered_principal_is_delivered_via_attach() {
     let (app_server, stats) = fake_app_server(FakeBehavior::default()).await;
@@ -522,6 +562,31 @@ async fn busy_thread_is_steered_without_waiting_for_idle() {
     )
     .await
     .expect("delivery steered into an active turn should process");
+    assert_eq!(stats.steers.load(AtOrd::SeqCst), 1);
+    assert_eq!(stats.turns_started.load(AtOrd::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn steer_success_without_turn_id_fails_without_retry() {
+    let (app_server, stats) = fake_app_server(FakeBehavior {
+        busy_reads: 1,
+        omit_steer_turn_id: true,
+        ..Default::default()
+    })
+    .await;
+    let (addr, _broker) = start_broker().await;
+    let (_codex_agent, sent, mut admin) = register_and_send(addr, &app_server).await;
+
+    let reason = wait_for_failed_reason(
+        &mut admin,
+        sent.message_id,
+        "steer response without a turn id should fail",
+    )
+    .await;
+    assert!(
+        reason.contains("turn/steer returned no turn id"),
+        "{reason}"
+    );
     assert_eq!(stats.steers.load(AtOrd::SeqCst), 1);
     assert_eq!(stats.turns_started.load(AtOrd::SeqCst), 0);
 }
@@ -631,6 +696,83 @@ async fn unloaded_thread_is_resumed_before_delivery() {
         1,
         "exactly one thread/resume expected"
     );
+}
+
+#[tokio::test]
+async fn unload_between_idle_read_and_turn_start_resumes_once() {
+    let (app_server, stats) = fake_app_server(FakeBehavior {
+        unload_at_turn_start: true,
+        ..Default::default()
+    })
+    .await;
+    let (addr, _broker) = start_broker().await;
+    let (_codex_agent, sent, mut admin) = register_and_send(addr, &app_server).await;
+
+    wait_for_ack(
+        &mut admin,
+        sent.message_id,
+        "@codex-1",
+        AckState::Processed,
+        120,
+    )
+    .await
+    .expect("turn/start unload race should resume and process the delivery");
+    assert_eq!(stats.resumes.load(AtOrd::SeqCst), 1);
+    assert_eq!(stats.turns_started.load(AtOrd::SeqCst), 1);
+    assert_eq!(stats.steers.load(AtOrd::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn turn_start_success_without_turn_id_fails_without_retry() {
+    let (app_server, stats) = fake_app_server(FakeBehavior {
+        omit_start_turn_id: true,
+        ..Default::default()
+    })
+    .await;
+    let (addr, _broker) = start_broker().await;
+    let (_codex_agent, sent, mut admin) = register_and_send(addr, &app_server).await;
+
+    let reason = wait_for_failed_reason(
+        &mut admin,
+        sent.message_id,
+        "turn/start response without a turn id should fail",
+    )
+    .await;
+    assert!(
+        reason.contains("turn/start returned no turn id"),
+        "{reason}"
+    );
+    assert_eq!(stats.turns_started.load(AtOrd::SeqCst), 1);
+    assert_eq!(stats.resumes.load(AtOrd::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn completion_poll_rpc_error_is_terminal() {
+    let (app_server, stats) = fake_app_server(FakeBehavior {
+        poll_rpc_error: true,
+        ..Default::default()
+    })
+    .await;
+    let (addr, _broker) = start_broker().await;
+    let (_codex_agent, sent, mut admin) = register_and_send(addr, &app_server).await;
+
+    let reason = wait_for_failed_reason(
+        &mut admin,
+        sent.message_id,
+        "completion poll RPC error should terminate the committed delivery",
+    )
+    .await;
+    assert!(
+        reason.contains("poll failed: completion poll failed"),
+        "{reason}"
+    );
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        stats.turns_started.load(AtOrd::SeqCst),
+        1,
+        "committed delivery must not retry after a poll failure"
+    );
+    assert_eq!(stats.resumes.load(AtOrd::SeqCst), 0);
 }
 
 #[tokio::test]
