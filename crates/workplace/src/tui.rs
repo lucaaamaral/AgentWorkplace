@@ -1429,6 +1429,32 @@ mod tests {
                 limit: 20
             }
         );
+        assert_eq!(
+            parse_command("/create #fresh"),
+            Command::Create {
+                name: "#fresh".into()
+            }
+        );
+        assert_eq!(
+            parse_command("/thread nope"),
+            Command::Usage("usage: /thread <thread_id>  (or /thread to clear)")
+        );
+        assert_eq!(
+            parse_command("/sub @only"),
+            Command::Usage("usage: /sub @principal #channel")
+        );
+        assert_eq!(
+            parse_command("/rename #only"),
+            Command::Usage("usage: /rename #old #new")
+        );
+        assert_eq!(
+            parse_command("/history"),
+            Command::Usage("usage: /history <#channel|@principal> [limit]")
+        );
+        assert_eq!(
+            parse_command("/reply 42 no targets"),
+            Command::Usage("usage: /reply <thread_id> <#chan|@principal ...> <body>")
+        );
         assert_eq!(parse_command("/who"), Command::Who);
         assert_eq!(parse_command("/daemon"), Command::Daemon);
         assert_eq!(parse_command("/shutdown"), Command::Shutdown);
