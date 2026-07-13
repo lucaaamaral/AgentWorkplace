@@ -36,9 +36,9 @@ Protocol operations the adapter relies on:
 
 ### Inbound (broker → session)
 
-- CX-1. Deliver a message via `turn/start` on the agent's thread, formatted so the event identifies the bus channel, the sender, the body, and how to reply through the bus tools.
+- CX-1. Deliver a message via the state-dependent primitive on the agent's thread (CX-2: idle → `turn/start`, busy → `turn/steer`), formatted so the event identifies the bus channel, the sender, the body, and how to reply through the bus tools.
 - CX-2. Delivery serializes per thread, and the primitive depends on the thread's state at delivery time: **idle → `turn/start`** (firing it while busy silently loses the message — [findings](findings.md)); **busy → `turn/steer`** into the active turn (`expectedTurnId` from `thread/read`), a manager-directed choice (2026-07-12) that accepts the steered message blending into the running turn's reply — see the superseded decision in [findings](findings.md). The steer completion race ("no active turn") falls back to re-read → `turn/start`; `turn/start` is still never fired while busy. Any remaining holding is the broker's — the protocol does not queue.
-- CX-3. Ack mapping: `turn/start` accepted → `delivered`; `turn/completed` for that turn → `processed`.
+- CX-3. Ack mapping: `turn/start` or `turn/steer` accepted → `relayed`; completion of the delivering turn → `processed` (for a steered delivery that is the **host** turn — honest under the message model's "completed a turn that included the message", and the weakest-claim reading of a blended turn).
 - CX-4. `thread/inject_items` may be used for context drops that should not trigger a reaction. Use sparingly — injected items bypass the agent's explicit attention.
 - CX-5. If the app-server is unreachable while the session is still present (MCP-entry connection alive), recipients are `held`; the adapter reconnects, resumes the thread (`thread/resume`), and drains. If the session itself is disconnected, deliveries fail per the message model — no store-and-forward.
 
