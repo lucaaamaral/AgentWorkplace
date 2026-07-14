@@ -61,11 +61,12 @@ broker = "127.0.0.1:9675"
 
 [codex]
 # Shared Codex app-server for `codex --remote` sessions. When set, the daemon
-# spawns and supervises `codex app-server --listen <this>` — the user never
-# runs it. The app-server is left running across daemon restarts and re-adopted
-# on the next start (see "Codex app-server supervision" below), so a broker
-# restart does not drop attached Codex sessions. Omit to disable Codex push
-# delivery; plain `codex` sessions then participate outbound-only.
+# supervises this endpoint: it launches `codex app-server --listen <this>` when
+# absent or adopts a compatible server already listening. A daemon-launched
+# app-server remains running across daemon restarts and is re-adopted on the
+# next start (see "Codex app-server supervision" below), so a broker restart
+# does not drop attached Codex sessions. Omit to disable Codex push delivery;
+# plain `codex` sessions then participate outbound-only.
 # app_server = "ws://127.0.0.1:9701"
 # Capability-token file for the shared app-server (recommended even on
 # loopback: any local process could otherwise drive the agent). The daemon
@@ -95,7 +96,7 @@ The broker's authorization model is deliberately thin and must be understood bef
 
 ## Codex app-server supervision
 
-When `[codex].app_server` is set, the daemon keeps a shared `codex app-server --listen <endpoint>` alive for `codex --remote` sessions to attach to. It supervises the **endpoint**, not merely a child it owns — so the Codex engine and attached `codex --remote` windows survive a broker restart. (Continuity here means the app-server and its sessions: the broker's own JSON-RPC is briefly unavailable while the daemon restarts.)
+When `[codex].app_server` is set, the daemon manages a shared `codex app-server --listen <endpoint>` for `codex --remote` sessions. It supervises the **endpoint**, not merely a child it owns: it adopts a compatible server already listening or launches one when the endpoint is absent. On Unix, the Codex engine and attached `codex --remote` windows survive a broker restart. (Continuity here means the app-server and its sessions; the broker's own JSON-RPC is briefly unavailable while the daemon restarts.)
 
 **State machine.** Roughly every two seconds the daemon runs a shallow readiness probe — a `GET /readyz` over TCP to the endpoint's host:port — and acts on the result:
 
@@ -105,7 +106,7 @@ When `[codex].app_server` is set, the daemon keeps a shared `codex app-server --
 
 The endpoint the daemon adopts may be one it spawned or one **left running by a previous daemon** — adopting either is what makes broker restarts transparent to attached Codex sessions.
 
-**Detached lifetime (Codex-session continuity).** A spawned app-server is deliberately **not** bound to the daemon's lifetime: it is started detached — `kill_on_drop(false)` and its own process group (Unix `process_group(0)`, the verified path; Windows `CREATE_NEW_PROCESS_GROUP`, best-effort and not exercised in CI), stdio to null. On Unix, when the daemon exits or restarts the app-server keeps running and `codex --remote` windows stay attached; the next daemon re-adopts it after verifying health. This supersedes an earlier model that killed the app-server on daemon shutdown.
+**Detached lifetime (Codex-session continuity).** A spawned app-server is deliberately **not** bound to the daemon's lifetime: it is started detached — `kill_on_drop(false)` and its own process group (Unix `process_group(0)`, the verified path; Windows `CREATE_NEW_PROCESS_GROUP`, best-effort and not exercised in CI), stdio to null. On Unix, when the daemon exits or restarts the app-server keeps running and `codex --remote` windows stay attached; the next daemon re-adopts it after verifying health.
 
 **Backoff.** Two independent backoffs keep failure loops cheap:
 
@@ -114,7 +115,7 @@ The endpoint the daemon adopts may be one it spawned or one **left running by a 
 
 **Authentication.** With `[codex].token_file` set, adoption requires **both** a successful authenticated `initialize` **and** that the endpoint refuses an unauthenticated client: an app-server that accepts no-token connections is rejected rather than adopted. Without a token file, any local process can drive the agent (the loopback trust posture); setting one is recommended even on loopback.
 
-**Stopping the app-server (deferred).** Because a spawned app-server survives daemon exit by design, workplace has **no owned command to stop it** — it tracks no PID for the app-server across restarts and writes no pidfile for it. Stopping a managed app-server is currently a manual operation (terminate the `codex app-server --listen <endpoint>` process). A workplace-owned stop is deferred.
+**Stopping the app-server.** Because a spawned app-server survives daemon exit by design, `workplace` provides **no command to stop it**: it tracks no app-server PID across restarts and writes no pidfile. To stop the app-server, terminate the `codex app-server --listen <endpoint>` process through the operating system.
 
 ## On-disk layout
 
