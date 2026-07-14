@@ -60,22 +60,10 @@ broker = "127.0.0.1:9675"
 # database = ""
 
 [codex]
-# Shared Codex app-server for `codex --remote` sessions. When set, the daemon
-# supervises this endpoint: it launches `codex app-server --listen <this>` when
-# absent or adopts a compatible server already listening. A daemon-launched
-# app-server remains running across daemon restarts and is re-adopted on the
-# next start (see "Codex app-server supervision" below), so a broker restart
-# does not drop attached Codex sessions. Omit to disable Codex push delivery;
-# plain `codex` sessions then participate outbound-only.
+# Shared Codex app-server endpoint. Omit to disable Codex push delivery.
 # app_server = "ws://127.0.0.1:9701"
-# Capability-token file for the shared app-server (recommended even on
-# loopback: any local process could otherwise drive the agent). The daemon
-# adds `--ws-auth capability-token --ws-token-file <this>` and the attach
-# client presents the contents as `Authorization: Bearer` on the WebSocket
-# upgrade. The human's window must use the same token:
-#   CODEX_REMOTE_AUTH_TOKEN=$(<file) codex --remote <addr> \
-#     --remote-auth-token-env CODEX_REMOTE_AUTH_TOKEN
-# Requires a Codex build exposing --ws-auth (verified on codex-cli 0.144.1).
+# Capability-token file used when launching or adopting the app-server.
+# Recommended even on loopback.
 # token_file = ""
 
 [log]
@@ -96,26 +84,11 @@ The broker's authorization model is deliberately thin and must be understood bef
 
 ## Codex app-server supervision
 
-When `[codex].app_server` is set, the daemon manages a shared `codex app-server --listen <endpoint>` for `codex --remote` sessions. It supervises the **endpoint**, not merely a child it owns: it adopts a compatible server already listening or launches one when the endpoint is absent. On Unix, the Codex engine and attached `codex --remote` windows survive a broker restart. (Continuity here means the app-server and its sessions; the broker's own JSON-RPC is briefly unavailable while the daemon restarts.)
+When `[codex].app_server` is set, the daemon adopts a compatible server already listening at the endpoint or launches one when the endpoint is absent. It does not replace an occupied or unhealthy endpoint. Launch and adoption failures are retried with capped backoff.
 
-**State machine.** Roughly every two seconds the daemon runs a shallow readiness probe — a `GET /readyz` over TCP to the endpoint's host:port — and acts on the result:
+With `[codex].token_file` set, the same capability token is used when launching or adopting the server; an endpoint that does not enforce the token is rejected. Without a token file, the app-server relies on the documented loopback trust boundary.
 
-- **Ready** (`/readyz` → `200`) — if not already adopted, the daemon runs a **deep verification**: an authenticated `initialize` over the WebSocket (presenting the capability token when `token_file` is set) and, when a token is configured, a confirmation that the endpoint **rejects** an unauthenticated client. On success the endpoint is **adopted** and monitored by readyz thereafter; on failure it is treated as occupied and left alone — never spawned into.
-- **Absent** (nothing listening) — after a short debounce (two consecutive absent probes), the daemon **launches** `codex app-server --listen <endpoint>`, adding `--ws-auth capability-token --ws-token-file <file>` when `token_file` is set.
-- **Occupied** (listening but `/readyz` is non-200 or unresponsive) — the daemon **never spawns**; something already holds the endpoint. A server the daemon just spawned that is still starting logs as "spawned…not ready"; a genuinely foreign or unhealthy occupant logs as an error.
-
-The endpoint the daemon adopts may be one it spawned or one **left running by a previous daemon** — adopting either is what makes broker restarts transparent to attached Codex sessions.
-
-**Detached lifetime (Codex-session continuity).** A spawned app-server is deliberately **not** bound to the daemon's lifetime: it is started detached — `kill_on_drop(false)` and its own process group (Unix `process_group(0)`, the verified path; Windows `CREATE_NEW_PROCESS_GROUP`, best-effort and not exercised in CI), stdio to null. On Unix, when the daemon exits or restarts the app-server keeps running and `codex --remote` windows stay attached; the next daemon re-adopts it after verifying health.
-
-**Backoff.** Two independent backoffs keep failure loops cheap:
-
-- *Respawn*, after the app-server exits or fails to start: `1s → 30s`, doubling, reset only after the endpoint has been **adopted and healthy** for a stable window (30s) — a binary that starts but never becomes adoptable, or crashes immediately, never resets it to full speed.
-- *Deep-verification retry*, for a Ready-but-unadoptable endpoint (foreign protocol, auth mismatch): a separate `5s → 60s` capped backoff, so `initialize` is not re-attempted on every poll. It resets on successful adoption or on any real shallow-state change — the endpoint going Absent or Occupied.
-
-**Authentication.** With `[codex].token_file` set, adoption requires **both** a successful authenticated `initialize` **and** that the endpoint refuses an unauthenticated client: an app-server that accepts no-token connections is rejected rather than adopted. Without a token file, any local process can drive the agent (the loopback trust posture); setting one is recommended even on loopback.
-
-**Stopping the app-server.** Because a spawned app-server survives daemon exit by design, `workplace` provides **no command to stop it**: it tracks no app-server PID across restarts and writes no pidfile. To stop the app-server, terminate the `codex app-server --listen <endpoint>` process through the operating system.
+On Unix, a daemon-launched app-server remains running across daemon restarts and is adopted by the next daemon, preserving Codex sessions while the broker is briefly unavailable. Windows process detachment is best-effort. `workplace` provides no command or pidfile for stopping the app-server; terminate the process through the operating system when needed.
 
 ## On-disk layout
 
