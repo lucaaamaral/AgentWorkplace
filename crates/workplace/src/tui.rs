@@ -1011,6 +1011,18 @@ fn scroll_offset_rows(total_rows: usize, viewport_rows: usize, from_bottom: u16)
     )
 }
 
+/// Horizontal viewport for the single-line input. Keep one interior column
+/// free for the cursor and scroll by rendered terminal columns, not characters
+/// (wide Unicode glyphs occupy more than one column).
+fn input_viewport(display_width: usize, inner_width: u16) -> (u16, u16) {
+    let text_width = inner_width.saturating_sub(1) as usize;
+    let scroll = display_width.saturating_sub(text_width);
+    (
+        scroll.min(u16::MAX as usize) as u16,
+        display_width.min(text_width) as u16,
+    )
+}
+
 fn draw<B>(terminal: &mut Terminal<B>, app: &mut App) -> anyhow::Result<()>
 where
     B: ratatui::backend::Backend,
@@ -1056,19 +1068,19 @@ where
                 .block(Block::default().borders(Borders::ALL).title(title)),
             chunks[0],
         );
+        let input_line = Line::from(app.input.as_str());
+        let input_inner_width = chunks[1].width.saturating_sub(2);
+        let (input_scroll, cursor_column) = input_viewport(input_line.width(), input_inner_width);
         f.render_widget(
-            Paragraph::new(app.input.as_str()).block(
+            Paragraph::new(input_line).scroll((0, input_scroll)).block(
                 Block::default()
                     .borders(Borders::ALL)
                     .title(" input (/help) "),
             ),
             chunks[1],
         );
-        let cursor_x = chunks[1].x + 1 + app.input.chars().count() as u16;
-        f.set_cursor_position((
-            cursor_x.min(chunks[1].right().saturating_sub(2)),
-            chunks[1].y + 1,
-        ));
+        let cursor_x = chunks[1].x + 1 + cursor_column;
+        f.set_cursor_position((cursor_x, chunks[1].y + 1));
     })?;
     Ok(())
 }
@@ -1248,6 +1260,16 @@ mod tests {
         assert_eq!(scroll_offset_rows(50, 20, 999), (0, 30));
     }
 
+    #[test]
+    fn input_viewport_reserves_cursor_column_at_overflow_boundary() {
+        // An 18-column input interior displays at most 17 columns of text so
+        // the cursor remains visible in the final column.
+        assert_eq!(input_viewport(0, 18), (0, 0));
+        assert_eq!(input_viewport(3, 18), (0, 3));
+        assert_eq!(input_viewport(17, 18), (0, 17));
+        assert_eq!(input_viewport(18, 18), (1, 17));
+    }
+
     /// The blocking gap from review: prove line_count + Wrap + scroll put
     /// the right ROWS on screen, not just that the offset math is sound.
     #[test]
@@ -1305,6 +1327,51 @@ mod tests {
         );
         draw(&mut terminal, &mut app).unwrap();
         assert!(screen(&terminal).contains("TAILMARK"));
+    }
+
+    #[test]
+    fn render_input_follows_tail_and_positions_cursor_by_display_width() {
+        use ratatui::backend::TestBackend;
+
+        fn render(input: &str) -> (String, Position) {
+            let addr: SocketAddr = "127.0.0.1:1".parse().unwrap();
+            let mut app = App::new(addr, "@m".into());
+            app.input = input.into();
+            let mut terminal = Terminal::new(TestBackend::new(20, 8)).unwrap();
+            draw(&mut terminal, &mut app).unwrap();
+
+            // The input block occupies the final three rows; its interior is
+            // row 6, columns 1..=18.
+            let row = (1..=18)
+                .map(|x| terminal.backend().buffer().cell((x, 6)).unwrap().symbol())
+                .collect::<String>();
+            (row, terminal.backend().cursor_position())
+        }
+
+        let (row, cursor) = render("short");
+        assert!(row.contains("short"));
+        assert_eq!(cursor, Position::new(6, 6));
+
+        let (row, cursor) = render("PREFIX-0123456789-TAIL");
+        assert!(
+            row.contains("0123456789-TAIL"),
+            "tail must remain visible: {row:?}"
+        );
+        assert!(!row.contains("PREFIX"), "prefix must scroll out: {row:?}");
+        assert_eq!(cursor, Position::new(18, 6));
+
+        // Wide glyphs use rendered columns for both scrolling and cursor
+        // placement. Do not assert the clipped left cell: a two-column glyph
+        // can straddle the horizontal-scroll boundary.
+        let (row, cursor) = render("界abcdefghijklmnop");
+        assert!(
+            row.contains("lmnop"),
+            "wide-input tail must remain visible: {row:?}"
+        );
+        assert_eq!(cursor, Position::new(18, 6));
+
+        let (_, cursor) = render("界a");
+        assert_eq!(cursor, Position::new(4, 6));
     }
 
     #[test]
