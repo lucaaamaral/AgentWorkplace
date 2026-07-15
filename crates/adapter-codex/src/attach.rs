@@ -41,6 +41,17 @@ fn unload_hint(e: &str) -> bool {
 fn thread_gone(e: &str) -> bool {
     e.to_ascii_lowercase().contains("no rollout")
 }
+
+/// Whether a `thread/resume` result means this connection *may* now hold the
+/// implicit subscription, so it must attempt a best-effort release. `Ok` did
+/// subscribe; a `Transport` error is ambiguous — a timed-out response may have
+/// subscribed on a still-live socket (`call` does not close the connection on
+/// timeout) — so treat it as "maybe". A definitive RPC error means the server
+/// rejected the resume: nothing was subscribed and nothing to release.
+fn resume_may_have_subscribed(result: &Result<(), CallError>) -> bool {
+    !matches!(result, Err(CallError::Rpc(_)))
+}
+
 const TURN_TIMEOUT: Duration = Duration::from_secs(300);
 const POLL_INTERVAL: Duration = Duration::from_millis(1500);
 /// Bound on a single inbound app-server frame/message — a transport memory
@@ -214,6 +225,18 @@ impl CodexAttach {
             .map(|_| ())
     }
 
+    /// `thread/unsubscribe` this connection from a thread, releasing the
+    /// listener that `thread/resume` implicitly added (findings.md). Without
+    /// it, a persistent attach pins every thread it resumes loaded forever,
+    /// blocking Codex's no-subscriber idle-unload — a permanent bus-presence
+    /// ghost. Best-effort at the call sites: never authoritative over a
+    /// committed delivery outcome.
+    async fn unsubscribe_thread(&self, thread_id: &str) -> Result<(), CallError> {
+        self.call("thread/unsubscribe", json!({ "threadId": thread_id }))
+            .await
+            .map(|_| ())
+    }
+
     /// Read thread status and, while active, the in-progress turn id required
     /// by turn/steer. `thread/read` errors before the first user message
     /// ("not materialized yet") — treated as idle.
@@ -286,10 +309,55 @@ impl CodexAttach {
         let lock = self.thread_lock(thread_id);
         let _guard = lock.lock().await;
 
+        // `thread/resume` implicitly subscribes THIS connection to the thread
+        // (findings.md). A persistent attach that resumes and never releases
+        // pins the thread loaded forever, blocking Codex's no-subscriber idle
+        // unload — a permanent bus-presence ghost. Track whether a resume here
+        // may have taken that subscription so we can drop it below.
+        let mut maybe_subscribed = false;
+        let committed = self
+            .deliver_inner(thread_id, text, &mut maybe_subscribed)
+            .await;
+
+        // Release the resume subscription immediately after the commit point,
+        // before completion polling: the just-started turn keeps the thread
+        // active (so it cannot idle-unload mid-delivery anyway) and thread/read
+        // polling is subscription-independent, so this minimizes the pin
+        // window. Only when a resume here may have taken the subscription —
+        // turn/start on a loaded thread does not subscribe, and a thread/start
+        // subscription belongs to whoever made it; an ambiguous transport
+        // timeout counts, because the socket may still be live and subscribed.
+        // Best-effort: a failure is logged and MUST NOT rewrite the committed
+        // delivery outcome; on a genuinely closed connection the unsubscribe
+        // simply errors harmlessly.
+        if maybe_subscribed && let Err(e) = self.unsubscribe_thread(thread_id).await {
+            tracing::warn!(
+                thread_id,
+                "thread/unsubscribe after delivery failed (best-effort): {e}"
+            );
+        }
+
+        match committed {
+            Ok((turn_id, mode)) => self.poll_completion(thread_id, &turn_id, mode).await,
+            Err(outcome) => outcome,
+        }
+    }
+
+    /// Drive the thread to the delivery COMMIT POINT: an accepted `turn/start`
+    /// (idle thread) or `turn/steer` (busy thread). Returns the committed
+    /// `(turn id, mode)`, or a terminal [`Delivered`] for a pre-commit failure.
+    /// Sets `*maybe_subscribed` when a `thread/resume` here may have taken a
+    /// listener subscription the caller should release best-effort.
+    async fn deliver_inner(
+        &self,
+        thread_id: &str,
+        text: &str,
+        maybe_subscribed: &mut bool,
+    ) -> Result<(String, &'static str), Delivered> {
         let mut resumed = false;
         let mut steer_refused = false;
         let deadline = tokio::time::Instant::now() + TURN_TIMEOUT;
-        let (turn_id, mode) = loop {
+        loop {
             match self.thread_state(thread_id).await {
                 Ok(ThreadState::Busy(Some(active_turn))) if !steer_refused => {
                     // COMMIT POINT, same discipline as turn/start: after the
@@ -313,16 +381,18 @@ impl CodexAttach {
                                     turn_id = id,
                                     "bus delivery steered into active turn"
                                 );
-                                break (id.to_string(), "turn/steer");
+                                return Ok((id.to_string(), "turn/steer"));
                             }
                             None => {
-                                return Delivered::Failed("turn/steer returned no turn id".into());
+                                return Err(Delivered::Failed(
+                                    "turn/steer returned no turn id".into(),
+                                ));
                             }
                         },
                         Err(CallError::Transport(e)) => {
-                            return Delivered::Failed(format!(
+                            return Err(Delivered::Failed(format!(
                                 "transport failure during turn/steer; completion unknown: {e}"
-                            ));
+                            )));
                         }
                         Err(CallError::Rpc(e)) => {
                             // The host turn may have completed between read and
@@ -340,7 +410,7 @@ impl CodexAttach {
                 }
                 Ok(ThreadState::Busy(_)) => {
                     if tokio::time::Instant::now() > deadline {
-                        return Delivered::Failed("thread stayed busy past timeout".into());
+                        return Err(Delivered::Failed("thread stayed busy past timeout".into()));
                     }
                     tokio::time::sleep(POLL_INTERVAL).await;
                 }
@@ -355,73 +425,88 @@ impl CodexAttach {
                         .await
                     {
                         Ok(v) => match v.pointer("/turn/id").and_then(Value::as_str) {
-                            Some(id) => break (id.to_string(), "turn/start"),
+                            Some(id) => return Ok((id.to_string(), "turn/start")),
                             None => {
-                                return Delivered::Failed(
+                                return Err(Delivered::Failed(
                                     "turn/start returned no turn id".into(),
-                                );
+                                ));
                             }
                         },
                         Err(CallError::Transport(e)) => {
-                            return Delivered::Failed(format!(
+                            return Err(Delivered::Failed(format!(
                                 "transport failure during turn/start; completion unknown: {e}"
-                            ));
+                            )));
                         }
                         Err(CallError::Rpc(e)) => {
                             if thread_gone(&e) {
-                                return Delivered::Failed(format!("thread gone: {e}"));
+                                return Err(Delivered::Failed(format!("thread gone: {e}")));
                             }
                             if resumed || !unload_hint(&e) {
-                                return Delivered::Failed(e);
+                                return Err(Delivered::Failed(e));
                             }
                             resumed = true;
-                            match self.resume_thread(thread_id).await {
+                            let resumed_result = self.resume_thread(thread_id).await;
+                            if resume_may_have_subscribed(&resumed_result) {
+                                *maybe_subscribed = true;
+                            }
+                            match resumed_result {
                                 Ok(()) => continue,
                                 Err(CallError::Transport(t)) => {
-                                    return Delivered::Failed(format!(
+                                    return Err(Delivered::Failed(format!(
                                         "transport failure during resume after turn/start attempt; \
                                          completion unknown: {t}"
-                                    ));
+                                    )));
                                 }
                                 Err(CallError::Rpc(r)) => {
-                                    return Delivered::Failed(format!("thread gone: {r}"));
+                                    return Err(Delivered::Failed(format!("thread gone: {r}")));
                                 }
                             }
                         }
                     }
                 }
-                Err(CallError::Transport(e)) => return Delivered::Unreachable(e),
+                Err(CallError::Transport(e)) => return Err(Delivered::Unreachable(e)),
                 Err(CallError::Rpc(e)) => {
                     // Resume ONLY on a positively identified unload: resuming
                     // a loaded thread clears its goal state (findings.md), so
                     // an unrelated RPC error must fail, not resume. "no
                     // rollout" means the thread is gone entirely — terminal.
                     if thread_gone(&e) {
-                        return Delivered::Failed(format!("thread gone: {e}"));
+                        return Err(Delivered::Failed(format!("thread gone: {e}")));
                     }
                     if resumed || !unload_hint(&e) {
-                        return Delivered::Failed(format!("thread/read failed: {e}"));
+                        return Err(Delivered::Failed(format!("thread/read failed: {e}")));
                     }
                     resumed = true;
-                    match self.resume_thread(thread_id).await {
+                    let resumed_result = self.resume_thread(thread_id).await;
+                    if resume_may_have_subscribed(&resumed_result) {
+                        *maybe_subscribed = true;
+                    }
+                    match resumed_result {
                         Ok(()) => continue,
-                        Err(CallError::Transport(t)) => return Delivered::Unreachable(t),
+                        Err(CallError::Transport(t)) => return Err(Delivered::Unreachable(t)),
                         Err(CallError::Rpc(r)) => {
-                            return Delivered::Failed(format!("thread gone: {r}"));
+                            return Err(Delivered::Failed(format!("thread gone: {r}")));
                         }
                     }
                 }
             }
-        };
+        }
+    }
 
-        // Poll for this turn's completion (the processed ack). A transport
-        // loss here is NOT retriable: the turn already started, so retrying
-        // the delivery would inject the message twice — report failed with
-        // the completion unknown instead.
+    /// Poll `thread/read` for the delivering turn's completion (the `processed`
+    /// ack). A transport loss here is NOT retriable: the turn already started,
+    /// so retrying the delivery would inject the message twice — report Failed
+    /// with "completion unknown" instead.
+    async fn poll_completion(
+        &self,
+        thread_id: &str,
+        turn_id: &str,
+        mode: &'static str,
+    ) -> Delivered {
         let deadline = tokio::time::Instant::now() + TURN_TIMEOUT;
         loop {
             tokio::time::sleep(POLL_INTERVAL).await;
-            match self.turn_status(thread_id, &turn_id).await {
+            match self.turn_status(thread_id, turn_id).await {
                 Ok(Some(status)) if status == "completed" => return Delivered::Processed,
                 Ok(Some(status))
                     if status == "failed" || status == "error" || status == "interrupted" =>
