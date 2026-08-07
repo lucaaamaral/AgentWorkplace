@@ -3,6 +3,7 @@
 //! Subcommands: `daemon` (broker), `cli` (interactive TUI), `shim-claude`
 //! (Claude Code channel shim, spawned by the harness), `completions`.
 
+mod codex_supervisor;
 mod config;
 mod tui;
 
@@ -124,10 +125,8 @@ fn run_daemon(cfg: config::ConfigFile) -> anyhow::Result<()> {
     let codex_token_file = cfg.codex.token_file.clone();
     tokio::runtime::Runtime::new()?.block_on(async move {
         if let Some(listen) = codex_app_server {
-            tokio::spawn(supervise_codex_app_server(listen, codex_token_file));
+            tokio::spawn(codex_supervisor::supervise(listen, codex_token_file));
         }
-        // Exit the runtime on SIGTERM/SIGINT so kill_on_drop reaps the
-        // managed app-server child (a signal-killed process runs no drops).
         tokio::select! {
             r = broker::run(broker_cfg) => r,
             _ = shutdown_signal() => {
@@ -151,54 +150,6 @@ async fn shutdown_signal() {
     #[cfg(not(unix))]
     {
         let _ = tokio::signal::ctrl_c().await;
-    }
-}
-
-/// Spawn and supervise the shared `codex app-server --listen <addr>` so
-/// `codex --remote <addr>` sessions have an engine to attach to. Restarts
-/// with backoff if it dies; the child is killed when the daemon exits.
-/// Backoff resets only after the child has stayed up — a spawn that crashes
-/// immediately must not restart at full speed forever.
-async fn supervise_codex_app_server(listen: String, token_file: Option<std::path::PathBuf>) {
-    const STABLE_UPTIME: Duration = Duration::from_secs(30);
-    let mut backoff = Duration::from_secs(1);
-    loop {
-        tracing::info!("starting managed codex app-server on {listen}");
-        let mut cmd = tokio::process::Command::new("codex");
-        cmd.args(["app-server", "--listen", &listen]);
-        if let Some(token_file) = &token_file {
-            // Capability-token auth (verified on codex-cli 0.144.1): any
-            // local process could otherwise drive the agent.
-            cmd.arg("--ws-auth")
-                .arg("capability-token")
-                .arg("--ws-token-file")
-                .arg(token_file);
-        }
-        let child = cmd
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .kill_on_drop(true)
-            .spawn();
-        match child {
-            Ok(mut child) => {
-                let started = std::time::Instant::now();
-                match child.wait().await {
-                    Ok(status) => {
-                        tracing::warn!("managed codex app-server exited ({status}); restarting")
-                    }
-                    Err(e) => tracing::warn!("managed codex app-server wait failed: {e}"),
-                }
-                if started.elapsed() >= STABLE_UPTIME {
-                    backoff = Duration::from_secs(1);
-                }
-            }
-            Err(e) => {
-                tracing::warn!("cannot start codex app-server ({e}); retrying in {backoff:?}");
-            }
-        }
-        tokio::time::sleep(backoff).await;
-        backoff = (backoff * 2).min(Duration::from_secs(30));
     }
 }
 

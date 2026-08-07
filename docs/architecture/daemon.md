@@ -60,19 +60,10 @@ broker = "127.0.0.1:9675"
 # database = ""
 
 [codex]
-# Shared Codex app-server for `codex --remote` sessions. When set, the daemon
-# spawns and supervises `codex app-server --listen <this>` (restarted if it
-# dies, killed on shutdown) — the user never runs it. Omit to disable Codex
-# push delivery; plain `codex` sessions then participate outbound-only.
+# Shared Codex app-server endpoint. Omit to disable Codex push delivery.
 # app_server = "ws://127.0.0.1:9701"
-# Capability-token file for the shared app-server (recommended even on
-# loopback: any local process could otherwise drive the agent). The daemon
-# adds `--ws-auth capability-token --ws-token-file <this>` and the attach
-# client presents the contents as `Authorization: Bearer` on the WebSocket
-# upgrade. The human's window must use the same token:
-#   CODEX_REMOTE_AUTH_TOKEN=$(<file) codex --remote <addr> \
-#     --remote-auth-token-env CODEX_REMOTE_AUTH_TOKEN
-# Requires a Codex build exposing --ws-auth (verified on codex-cli 0.144.1).
+# Capability-token file used when launching or adopting the app-server.
+# Recommended even on loopback.
 # token_file = ""
 
 [log]
@@ -90,6 +81,14 @@ The broker's authorization model is deliberately thin and must be understood bef
 - **Set `[broker].auth_token` before adding any non-loopback `listen` address.** With a token set, `session/hello` is refused without it (`UNAUTHORIZED`), which gates every other verb. The token is a shared secret in the config file — machine-level protection, not per-principal identity.
 - The broker only ever dials **loopback `ws://` endpoints** as Codex app-servers, whatever a registration self-reports — a wire-supplied URL must not be able to point bus traffic at an arbitrary host.
 - Transport hygiene: inbound lines are length-capped (body limit + envelope slack), `jsonrpc: "2.0"` is enforced on requests, and malformed lines get spec `-32700` responses.
+
+## Codex app-server supervision
+
+When `[codex].app_server` is set, the daemon adopts a compatible server already listening at the endpoint or launches one when the endpoint is absent. It does not replace an occupied or unhealthy endpoint. Launch and adoption failures are retried with capped backoff.
+
+With `[codex].token_file` set, the same capability token is used when launching or adopting the server; an endpoint that does not enforce the token is rejected. Without a token file, the app-server relies on the documented loopback trust boundary.
+
+On Unix, a daemon-launched app-server remains running across daemon restarts and is adopted by the next daemon, preserving Codex sessions while the broker is briefly unavailable. Windows process detachment is best-effort. `workplace` provides no command or pidfile for stopping the app-server; terminate the process through the operating system when needed.
 
 ## On-disk layout
 
