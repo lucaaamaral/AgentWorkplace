@@ -142,6 +142,16 @@ pub async fn run(
                             let _ = ui_tx.send(Ui::Net(format_event(&ev)));
                         }
                     }
+                    Ok(Message::Notification(n)) if n.method == m::SESSION_EVICTED => {
+                        let by = serde_json::from_value::<EvictedParams>(
+                            n.params.unwrap_or(Value::Null),
+                        )
+                        .map(|p| p.by)
+                        .unwrap_or_else(|_| "another manager".into());
+                        let _ = ui_tx.send(Ui::Net(format!(
+                            "!! {by} force-disconnected this session — /quit and relaunch"
+                        )));
+                    }
                     Ok(Message::Request(req)) if req.method == m::MESSAGE_DELIVER => {
                         // Admin tap: acknowledge; display comes from watch.
                         let _ = out_tx.send(Message::Response(ok_response(
@@ -342,6 +352,7 @@ const COMMANDS: &[&str] = &[
     "/create",
     "/daemon",
     "/delete",
+    "/disconnect",
     "/focus",
     "/help",
     "/history",
@@ -434,6 +445,9 @@ enum Command {
     Rename {
         old: String,
         new: String,
+    },
+    Disconnect {
+        principal: String,
     },
     Archive {
         channel: String,
@@ -542,6 +556,13 @@ fn parse_command(line: &str) -> Command {
             Command::Rename {
                 old: old.to_string(),
                 new: new.to_string(),
+            }
+        }
+        "/disconnect" => {
+            if rest.starts_with('@') && !rest.contains(char::is_whitespace) {
+                Command::Disconnect { principal: rest }
+            } else {
+                Command::Usage("usage: /disconnect @principal")
             }
         }
         "/archive" => Command::Archive {
@@ -663,6 +684,31 @@ fn run_command(app: &mut App, client: &Arc<Client>, ui_tx: &mpsc::UnboundedSende
                 m::CHANNEL_RENAME,
                 json!({ "channel": old, "new_name": new }),
             );
+        }
+        Command::Disconnect { principal } => {
+            spawn_rpc(client, ui_tx, move |client, ui_tx| async move {
+                match client
+                    .call(m::ADMIN_DISCONNECT, json!({ "principal": principal }))
+                    .await
+                {
+                    Ok(v) => {
+                        let Ok(r) = serde_json::from_value::<DisconnectResult>(v) else {
+                            return;
+                        };
+                        out(
+                            &ui_tx,
+                            match r.sessions {
+                                0 => format!("{} held no session; the name is free", r.principal),
+                                n => format!(
+                                    "dropped {n} session(s) holding {}; the name is free",
+                                    r.principal
+                                ),
+                            },
+                        );
+                    }
+                    Err(e) => out(&ui_tx, format!("error: {}", e.message)),
+                }
+            });
         }
         Command::Archive { channel, archive } => {
             let method = if archive {
@@ -941,6 +987,9 @@ fn format_system(e: &SystemEvent) -> String {
         }
         SystemEvent::Deregistered { principal } => format!("{principal} deregistered"),
         SystemEvent::Disconnected { principal } => format!("{principal} disconnected"),
+        SystemEvent::ForceDisconnected { principal, by } => {
+            format!("{by} force-disconnected {principal} (name freed)")
+        }
         SystemEvent::Subscribed {
             principal,
             channel,
@@ -992,6 +1041,7 @@ commands:
   /sub @p #chan              /unsub @p #chan        (admin overrides)
   /archive #chan             /unarchive #chan
   /delete #chan              then /confirm #chan    (PERMANENT)
+  /disconnect @p             drop @p's session, freeing the name
   /history <#c|@p> [n]       /status <msg-id>
   /who                       /daemon
   /shutdown                  /quit
@@ -1174,6 +1224,12 @@ mod tests {
             admin: true,
         });
         assert!(s.contains("@a") && s.contains("(admin)"));
+
+        let s = format_system(&SystemEvent::ForceDisconnected {
+            principal: "@stuck".into(),
+            by: "@manager".into(),
+        });
+        assert!(s.contains("@manager") && s.contains("@stuck") && s.contains("force-disconnected"));
 
         let s = format_system(&SystemEvent::Unsubscribed {
             principal: "@a".into(),
@@ -1447,6 +1503,24 @@ mod tests {
                 old: "#old".into(),
                 new: "#new".into()
             }
+        );
+        assert_eq!(
+            parse_command("/disconnect @stuck"),
+            Command::Disconnect {
+                principal: "@stuck".into()
+            }
+        );
+        assert_eq!(
+            parse_command("/disconnect stuck"),
+            Command::Usage("usage: /disconnect @principal")
+        );
+        assert_eq!(
+            parse_command("/disconnect"),
+            Command::Usage("usage: /disconnect @principal")
+        );
+        assert_eq!(
+            parse_command("/disconnect @a @b"),
+            Command::Usage("usage: /disconnect @principal")
         );
         assert_eq!(
             parse_command("/archive #x"),

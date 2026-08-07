@@ -22,3 +22,5 @@ None at the connection level: an MCP channel server is not told whether the sess
 ## Identity carrier
 
 The shim holds the session→principal binding after `register` and stamps it on all subsequent traffic. One shim instance per session; the binding dies with the connection (implicit unbind) or with `deregister`.
+
+A shim outlives its broker connection and replays the binding on reconnect, so a manager force-disconnect would otherwise be undone within a second. On `session/evicted` the shim drops the binding and pushes a channel event telling the session its name was released; it stays connected and its tools keep working, but registering again is the session's own act.

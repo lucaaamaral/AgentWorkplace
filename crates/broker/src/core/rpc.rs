@@ -38,6 +38,15 @@ impl Broker {
         if *self.0.shutdown_tx.borrow() {
             return Err(ErrorCode::ShuttingDown.to_error("broker is shutting down"));
         }
+        if session.evicted() {
+            // The principal is already released; this connection is being
+            // torn down and must not act — least of all re-register the name.
+            return Err(RpcError {
+                code: -32600,
+                message: "session was force-disconnected by the manager".into(),
+                data: None,
+            });
+        }
         if method != m::SESSION_HELLO && session.state.lock().unwrap().client_info.is_none() {
             return Err(RpcError {
                 code: -32600,
@@ -58,6 +67,7 @@ impl Broker {
             m::DIRECTORY_WHO => self.who(),
             m::ADMIN_SUBSCRIBE => self.admin_subscription(session, parse(params)?, true),
             m::ADMIN_UNSUBSCRIBE => self.admin_subscription(session, parse(params)?, false),
+            m::ADMIN_DISCONNECT => self.admin_disconnect(session, parse(params)?),
             m::CHANNEL_RENAME => self.rename(session, parse(params)?),
             m::CHANNEL_ARCHIVE => self.archive(session, parse(params)?, true),
             m::CHANNEL_UNARCHIVE => self.archive(session, parse(params)?, false),
@@ -600,6 +610,31 @@ impl Broker {
             );
         }
         Ok(Value::Null)
+    }
+
+    /// Free a principal name by dropping the sessions holding it. Succeeds
+    /// with `sessions: 0` when nothing was claiming the name: the operator
+    /// asked for the name to be free, and it is.
+    fn admin_disconnect(
+        &self,
+        session: &Arc<Session>,
+        p: DisconnectParams,
+    ) -> Result<Value, RpcError> {
+        let by = self.require_admin(session)?;
+        if p.principal == by {
+            // Dropping your own connection is what quitting the client does;
+            // as an admin verb it would only kill the session mid-call.
+            return Err(RpcError {
+                code: -32602,
+                message: "cannot force-disconnect your own session".into(),
+                data: None,
+            });
+        }
+        let sessions = self.force_disconnect(&p.principal, &by);
+        to_value(DisconnectResult {
+            principal: p.principal,
+            sessions: sessions as u32,
+        })
     }
 
     fn rename(&self, session: &Arc<Session>, p: ChannelRenameParams) -> Result<Value, RpcError> {

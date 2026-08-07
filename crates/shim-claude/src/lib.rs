@@ -396,6 +396,31 @@ async fn connected_loop(
                             }
                         }
                     }
+                    Ok(Message::Notification(n)) if n.method == m::SESSION_EVICTED => {
+                        // The manager revoked this principal and is closing
+                        // the connection. Drop the carried binding: the
+                        // reconnect below must not silently re-claim a name
+                        // the manager just freed. The session keeps its bus
+                        // tools and can register again — as an explicit act.
+                        *binding = None;
+                        *delivery_block.lock().unwrap() = None;
+                        let p: Option<protocol::EvictedParams> =
+                            serde_json::from_value(n.params.unwrap_or(Value::Null)).ok();
+                        let (principal, by) = match &p {
+                            Some(p) => (p.principal.as_str(), p.by.as_str()),
+                            None => ("this session's principal", "the manager"),
+                        };
+                        tracing::warn!("{by} force-disconnected {principal}");
+                        let _ = mcp_tx.send(json!({
+                            "jsonrpc": "2.0",
+                            "method": "notifications/claude/channel",
+                            "params": { "content": format!(
+                                "Bus notice: {by} released {principal} on the AgentWorkplace bus, \
+                                 so this session is no longer registered and will receive no bus \
+                                 messages. Do not re-register unless you are asked to."
+                            ) },
+                        }));
+                    }
                     Ok(Message::Notification(_)) => { /* watch events: shim never watches */ }
                     Err(e) => tracing::warn!("unparseable broker line: {e}"),
                 }

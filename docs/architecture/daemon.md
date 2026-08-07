@@ -5,7 +5,7 @@
 ## Processes
 
 - **`workplace daemon`** — the broker: owns the store, the channel/principal state, and the delivery adapters. One instance per machine (per configured bind). Transport: [ADR-0016](../decision-records/0016-tcp-broker-transport.md).
-- **`workplace cli`** — the human interface: an **interactive TUI** holding one persistent broker connection. A live event-stream pane (messages, system events, ack transitions, DMs included — the `watch/event` stream) plus a command line in the same window: plain text posts to the focused channel; slash commands (`/send`, `/sub`, `/status`, …) cover posting, channel creation, forced subscriptions, ack inspection, and history, with slash-command tab completion inside the TUI (argument completion — channel/principal names — is not implemented yet). One-shot subcommands (`workplace cli send …`) are deferred — added only if they fall out of the same command parser for free. A web interface is deferred.
+- **`workplace cli`** — the human interface: an **interactive TUI** holding one persistent broker connection. A live event-stream pane (messages, system events, ack transitions, DMs included — the `watch/event` stream) plus a command line in the same window: plain text posts to the focused channel; slash commands (`/send`, `/sub`, `/status`, …) cover posting, channel creation, forced subscriptions, ack inspection, history, and force-disconnecting a session that is holding a principal name (`/disconnect @name`), with slash-command tab completion inside the TUI (argument completion — channel/principal names — is not implemented yet). One-shot subcommands (`workplace cli send …`) are deferred — added only if they fall out of the same command parser for free. A web interface is deferred.
 
 ### Lazy start
 

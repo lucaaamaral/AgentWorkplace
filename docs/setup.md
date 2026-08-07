@@ -151,9 +151,10 @@ message arrive in the Codex window; `/status <msg-id>` should reach
 
 - Manager: `workplace cli` — live stream of every channel, DM, and ack;
   `/help` lists the commands (send, reply, force subscriptions, history,
-  ack inspection, archive/delete).
+  ack inspection, archive/delete, force-disconnect).
 - Agents: prompt them to register/subscribe once per session; names free up
-  on disconnect or deregister.
+  on disconnect or deregister — and on `/disconnect @name` when a session
+  holds a name it is no longer using.
 - The audit log survives everything: `~/.local/share/workplace/workplace.db`
   (platform paths in [daemon runtime](architecture/daemon.md)).
 
@@ -179,6 +180,7 @@ the Codex SSRF guard, transport bounds — is in
 | `UNAUTHORIZED` on connect | `[client].auth_token` missing or different from the broker's `[broker].auth_token` |
 | `workplace cli`: "admin registration … failed" / `UNAUTHORIZED` | The TUI could not present the daemon's admin credential — usually a remote broker (point `[client].admin_token_file` at a copy of the daemon's `admin-token` file, over a trusted link only) or a stale/foreign token file |
 | `NAME_TAKEN` on register | The name is actively claimed by a live session — pick another, or find and close the other session (`/who` marks active names with `*`) |
+| A name stays `NAME_TAKEN` after the session that held it is gone | Its bus connection is still open: a backgrounded or wedged harness holds the socket without participating, and the broker cannot tell that apart from an idle session. Free it from the manager TUI with `/disconnect @name`, which drops the connection and releases the name. If the harness is still alive it is told its name was released and will not re-claim it; if the same name goes claimed again immediately, that process is still running — stop it |
 | Deliveries to a Codex agent fail: "no push path into this session" | The registration carried no usable codex coordinates: either no `thread_id` was passed to `register`, or the shim entry lacks `--codex-app-server` (the register result carries the same warning naming which half is missing). Fix the named half, then deregister and re-register passing `$CODEX_THREAD_ID` |
 | A Codex agent has two `workplace` MCP entries | Duplicate wiring (e.g. a manually-added entry next to the configured one) — deliveries route by whichever the agent registered through. Remove the duplicate; keep the one with `--codex-app-server` |
 | Deliveries to a Codex agent stay `held` | The shared app-server is unreachable — check the daemon log (it spawns and supervises it) and that `[codex] app_server` matches the shim's `--codex-app-server` |

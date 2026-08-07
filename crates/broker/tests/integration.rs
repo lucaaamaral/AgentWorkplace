@@ -1230,6 +1230,154 @@ async fn rpc_guards_status_and_watch_stop() {
 }
 
 #[tokio::test]
+async fn manager_force_disconnect_frees_a_stuck_name() {
+    let (addr, _broker) = start_broker(test_cfg()).await;
+
+    let mut admin = Client::connect_hello(addr).await;
+    admin
+        .call(
+            m::ADMIN_REGISTER,
+            json!({ "name": "@manager", "admin_token": "test-admin" }),
+        )
+        .await
+        .unwrap();
+    admin.call(m::WATCH_START, json!({})).await.unwrap();
+
+    // The backgrounded-harness case: the peer never speaks or closes again,
+    // so the broker sees an ordinary attached session and the name stays
+    // claimed. Nothing short of the manager can tell it apart from an idle
+    // one.
+    let mut stuck = Client::connect_hello(addr).await;
+    stuck.register("@stuck").await;
+
+    let mut relaunch = Client::connect_hello(addr).await;
+    let err = relaunch
+        .call(m::PRINCIPAL_REGISTER, json!({ "name": "@stuck" }))
+        .await
+        .unwrap_err();
+    assert_eq!(err_name(&err), "NAME_TAKEN");
+
+    // A delivery it never answers stays held against that session.
+    let sent: SendResult = serde_json::from_value(
+        admin
+            .call(
+                m::MESSAGE_SEND,
+                json!({ "principals": ["@stuck"], "body": "ping" }),
+            )
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(sent.delivery.delivered, vec!["@stuck"]);
+
+    // Admin verb, and not a way to drop your own connection.
+    let err = relaunch
+        .call(m::ADMIN_DISCONNECT, json!({ "principal": "@stuck" }))
+        .await
+        .unwrap_err();
+    assert_eq!(err_name(&err), "NOT_ADMIN");
+    let err = admin
+        .call(m::ADMIN_DISCONNECT, json!({ "principal": "@manager" }))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code, -32602);
+
+    let dropped: DisconnectResult = serde_json::from_value(
+        admin
+            .call(m::ADMIN_DISCONNECT, json!({ "principal": "@stuck" }))
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(dropped.sessions, 1);
+
+    // Audited, attributed to the manager.
+    let mut saw_record = false;
+    for _ in 0..40 {
+        if let WatchEvent::Record(Record::System {
+            event: SystemEvent::ForceDisconnected { principal, by },
+            ..
+        }) = admin.next_watch().await
+        {
+            assert_eq!((principal.as_str(), by.as_str()), ("@stuck", "@manager"));
+            saw_record = true;
+            break;
+        }
+    }
+    assert!(saw_record, "force-disconnect must be logged");
+
+    // The name is free the moment the call returns — no waiting on the
+    // dropped connection's own teardown.
+    let who: WhoResult =
+        serde_json::from_value(admin.call(m::DIRECTORY_WHO, json!({})).await.unwrap()).unwrap();
+    assert!(
+        who.principals
+            .iter()
+            .any(|p| p.principal == "@stuck" && !p.active)
+    );
+    relaunch
+        .call(m::PRINCIPAL_REGISTER, json!({ "name": "@stuck" }))
+        .await
+        .unwrap();
+
+    // The held delivery fails against the dropped session, with the reason
+    // the manager caused.
+    let ack = wait_for_ack_state(&mut admin, sent.message_id, AckState::Failed).await;
+    assert_eq!(ack.reason.as_deref(), Some("force-disconnected"));
+
+    // Idempotent: the new claim is a different session, so a repeat drops it
+    // too; a name nobody holds reports zero rather than erroring.
+    let dropped: DisconnectResult = serde_json::from_value(
+        admin
+            .call(m::ADMIN_DISCONNECT, json!({ "principal": "@stuck" }))
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(dropped.sessions, 1);
+    let dropped: DisconnectResult = serde_json::from_value(
+        admin
+            .call(m::ADMIN_DISCONNECT, json!({ "principal": "@stuck" }))
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(dropped.sessions, 0);
+
+    // The dropped peer is told why before its socket closes: clients replay
+    // their binding on reconnect, so an unexplained close would just bring
+    // the name back.
+    // The close itself can trail the notice by the eviction flush window
+    // when a delivery task is still holding the outbound channel.
+    let deadline = tokio::time::Instant::now() + T;
+    let (mut closed, mut noticed) = (false, false);
+    while tokio::time::Instant::now() < deadline {
+        let remaining = deadline - tokio::time::Instant::now();
+        match tokio::time::timeout(remaining, stuck.reader.next_line()).await {
+            Ok(Ok(Some(line))) => {
+                if let Ok(Message::Notification(n)) = Message::parse(&line)
+                    && n.method == m::SESSION_EVICTED
+                {
+                    let p: EvictedParams = serde_json::from_value(n.params.unwrap()).unwrap();
+                    assert_eq!(
+                        (p.principal.as_str(), p.by.as_str()),
+                        ("@stuck", "@manager")
+                    );
+                    noticed = true;
+                }
+            }
+            Ok(Ok(None)) | Ok(Err(_)) => {
+                closed = true;
+                break;
+            }
+            Err(_) => break,
+        }
+    }
+    assert!(noticed, "the evicted peer must receive session/evicted");
+    assert!(closed, "a force-disconnected socket must be closed");
+}
+
+#[tokio::test]
 async fn jsonrpc_violations_get_spec_errors() {
     let (addr, _broker) = start_broker(test_cfg()).await;
     let mut c = Client::connect_hello(addr).await;
