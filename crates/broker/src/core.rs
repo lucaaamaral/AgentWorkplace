@@ -52,9 +52,12 @@ pub struct Session {
     /// Queue bound (BrokerConfig::max_out_queue, captured at attach).
     max_out_queue: usize,
     overflow: std::sync::atomic::AtomicBool,
-    /// Fired once when the outbound queue overflows, so the connection loop
-    /// wakes even while blocked on an idle reader.
-    pub(crate) overflow_notify: tokio::sync::Notify,
+    /// Set when the manager force-disconnected this session.
+    evicted: std::sync::atomic::AtomicBool,
+    /// Fired once when the session must be torn down (outbound overflow or
+    /// eviction), so the connection loop wakes even while blocked on an idle
+    /// reader.
+    pub(crate) close_notify: tokio::sync::Notify,
 }
 
 impl Session {
@@ -70,6 +73,22 @@ impl Session {
     /// the session down on its next iteration.
     pub fn overflowed(&self) -> bool {
         self.overflow.load(Ordering::Relaxed)
+    }
+
+    /// True once the manager force-disconnected this session. The principal
+    /// is already released; the connection itself dies on the next loop
+    /// iteration.
+    pub fn evicted(&self) -> bool {
+        self.evicted.load(Ordering::Relaxed)
+    }
+
+    /// Mark the session for teardown and wake the connection loop, which may
+    /// be blocked on a peer that never sends another byte.
+    fn evict(&self) {
+        self.evicted.store(true, Ordering::Relaxed);
+        // notify_one stores a permit, so the loop wakes even if it enters
+        // its select after this fires.
+        self.close_notify.notify_one();
     }
 
     pub(crate) fn send(&self, msg: Message) {
@@ -93,7 +112,7 @@ impl Session {
                 );
                 // notify_one stores a permit, so the connection loop wakes
                 // even if it enters its select after this fires.
-                self.overflow_notify.notify_one();
+                self.close_notify.notify_one();
             }
             return;
         }
@@ -239,36 +258,109 @@ impl Broker {
             queued: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             max_out_queue: self.0.cfg.max_out_queue,
             overflow: std::sync::atomic::AtomicBool::new(false),
-            overflow_notify: tokio::sync::Notify::new(),
+            evicted: std::sync::atomic::AtomicBool::new(false),
+            close_notify: tokio::sync::Notify::new(),
         });
         self.0.sessions.lock().unwrap().insert(id, session.clone());
         session
     }
 
     pub fn detach(&self, session: &Arc<Session>) {
-        self.0.sessions.lock().unwrap().remove(&session.id);
-        if let Some(principal) = session.principal() {
-            self.system_record(
-                &SystemEvent::Disconnected {
+        self.release(session, None);
+    }
+
+    /// Drop one session from the registry, freeing its principal, and fail
+    /// its held deliveries. Removal elects the single caller that does the
+    /// work, so this is idempotent: the connection loop's `detach` after a
+    /// force-disconnect finds the session already gone and returns.
+    fn release(&self, session: &Arc<Session>, forced_by: Option<&str>) {
+        if self
+            .0
+            .sessions
+            .lock()
+            .unwrap()
+            .remove(&session.id)
+            .is_none()
+        {
+            return;
+        }
+        let Some(principal) = session.principal() else {
+            return;
+        };
+        if forced_by.is_some() {
+            // The connection outlives this call until its loop wakes: unbind
+            // now so an evicted session cannot keep acting as the principal.
+            let mut st = session.state.lock().unwrap();
+            st.principal = None;
+            st.admin = false;
+            st.codex = None;
+        }
+        let (event, reason) = match forced_by {
+            Some(by) => (
+                SystemEvent::ForceDisconnected {
+                    principal: principal.clone(),
+                    by: by.to_string(),
+                },
+                "force-disconnected",
+            ),
+            None => (
+                SystemEvent::Disconnected {
                     principal: principal.clone(),
                 },
-                None,
-            );
-            // No store-and-forward across sessions: held deliveries for a
-            // departed recipient fail.
-            let held = self.0.store.held_for(&principal).unwrap_or_else(|e| {
-                tracing::error!("held sweep for {principal} failed: {e}");
-                Vec::new()
-            });
-            for record_id in held {
-                self.ack_update(
-                    record_id,
-                    &principal,
-                    AckState::Failed,
-                    Some("disconnected"),
-                );
-            }
+                "disconnected",
+            ),
+        };
+        self.system_record(&event, None);
+        // No store-and-forward across sessions: held deliveries for a
+        // departed recipient fail.
+        let held = self.0.store.held_for(&principal).unwrap_or_else(|e| {
+            tracing::error!("held sweep for {principal} failed: {e}");
+            Vec::new()
+        });
+        for record_id in held {
+            self.ack_update(record_id, &principal, AckState::Failed, Some(reason));
         }
+    }
+
+    /// Drop every session holding `principal` and close its connection.
+    ///
+    /// The broker cannot tell a live idle connection from one whose peer has
+    /// stopped participating without closing the socket (a backgrounded
+    /// harness): both are simply attached, so the name stays actively claimed
+    /// and re-registration keeps failing with `NAME_TAKEN`. Deciding that a
+    /// connection is stale is therefore the manager's call, and this is how
+    /// it is carried out. Returns the number of sessions dropped.
+    pub fn force_disconnect(&self, principal: &str, by: &str) -> usize {
+        let victims: Vec<Arc<Session>> = self
+            .sessions()
+            .into_iter()
+            .filter(|s| s.principal().as_deref() == Some(principal))
+            .collect();
+        for session in &victims {
+            // Tell the peer why its connection is about to close. Clients
+            // carry their binding across reconnects (session lifecycle,
+            // "Broker restart"), so without this notice a live-but-stale
+            // harness simply re-registers and the name is claimed again.
+            session.send(Message::Notification(notification(
+                m::SESSION_EVICTED,
+                EvictedParams {
+                    principal: principal.to_string(),
+                    by: by.to_string(),
+                },
+            )));
+            // Flag before releasing: dispatch refuses evicted sessions, so
+            // the connection cannot re-register the name it just lost in the
+            // window before its loop wakes.
+            session.evict();
+            self.release(session, Some(by));
+            tracing::info!(
+                session = session.id,
+                principal,
+                by,
+                "session force-disconnected by the manager"
+            );
+        }
+        victims.len()
     }
 
     fn sessions(&self) -> Vec<Arc<Session>> {

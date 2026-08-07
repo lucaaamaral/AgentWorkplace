@@ -26,6 +26,12 @@ Admin verbs are honored only on admin-registered sessions, and admin registratio
 
 First call on every connection (and the CLI's lazy-start health check). The session is anonymous until it registers; `client_info` feeds liveness display (CL-7 / CX analog).
 
+| Direction | Method | Params | Meaning |
+| --- | --- | --- | --- |
+| broker → client | `session/evicted` (notification) | `{principal, by}` | The manager revoked this session's principal (`admin/disconnect`) and the connection is closing |
+
+`session/evicted` is the one broker-initiated end of a session. A client that replays its binding across reconnects **must drop it on receipt** — reconnecting is fine, silently re-claiming the freed name is not — and should tell its session, which is now unregistered and will receive nothing.
+
 ## Agent surface
 
 The wire mapping of the [tool contract](message-model.md#tool-contract) — same operations, same semantics, one method each.
@@ -70,6 +76,7 @@ Broker-to-recipient delivery is a JSON-RPC **request whose response is the ackno
 | --- | --- | --- |
 | `admin/subscribe` | `{principal, channel}` | Force a subscription ([ADR-0009](../decision-records/0009-self-service-subscriptions-human-override.md)); `system` record attributed to the admin principal |
 | `admin/unsubscribe` | `{principal, channel}` | Cancel a subscription; same recording |
+| `admin/disconnect` | `{principal}` | Drop the sessions holding `principal` and close their connections, freeing the name. Returns `{principal, sessions}` |
 | `channel/rename` | `{channel, new_name}` | Display-name change; internal id immutable, history untouched. Works on archived channels (frees a name — [ADR-0018](../decision-records/0018-channel-lifecycle-archive-and-guarded-deletion.md)) |
 | `channel/archive` | `{channel}` | Hide from directory, refuse new subscriptions, force-cancel active ones (`system` records). Name stays reserved — one namespace across live and archived |
 | `channel/unarchive` | `{channel}` | Restore an archived channel. Unconditional: name reservation makes collision impossible |
@@ -79,6 +86,7 @@ Broker-to-recipient delivery is a JSON-RPC **request whose response is the ackno
 | `daemon/status` | `{}` | Version, uptime, connected sessions (`client_info`, bound principal), channel/principal counts |
 | `daemon/shutdown` | `{}` | Graceful stop |
 
+- `admin/disconnect` is the escape hatch for a name the broker cannot free on its own. A principal is claimed for as long as a session holds it, and a peer that stops participating without closing its socket (a backgrounded harness) is indistinguishable from a live idle one — so the claim outlives the useful session and re-registration keeps failing with `NAME_TAKEN`. Judging a connection stale is the manager's call; the broker then unbinds the principal, fails its held deliveries (reason: `force-disconnected`), records a `ForceDisconnected` `system` event attributed to the caller, sends the peer `session/evicted`, and closes the connection. The name is free when the call returns — not when the dropped connection finishes tearing down — and the evicted session's remaining requests are refused. Zero sessions is success, not an error: the postcondition is that the name is free. Disconnecting your own principal is `-32602` (that is what quitting the client is for).
 - Deletion always crosses at least two deliberate steps: the two-phase token handshake at the protocol, plus the interface's own confirmation (the TUI requires typing the channel name verbatim) — see [ADR-0018](../decision-records/0018-channel-lifecycle-archive-and-guarded-deletion.md).
 - An admin session's `history/get` accepts any channel and any DM pair: `{dm_between: [a, b]}`.
 - The manager sends through the same `message/send` — no privileged send path ([ADR-0006](../decision-records/0006-human-as-first-class-principal.md)).

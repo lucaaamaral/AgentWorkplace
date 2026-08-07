@@ -200,6 +200,9 @@ impl ErrorCode {
 pub mod methods {
     // Handshake
     pub const SESSION_HELLO: &str = "session/hello";
+    /// broker → client notification: this session's principal was revoked by
+    /// the manager and the connection is closing.
+    pub const SESSION_EVICTED: &str = "session/evicted";
     // Agent surface
     pub const PRINCIPAL_REGISTER: &str = "principal/register";
     pub const PRINCIPAL_DEREGISTER: &str = "principal/deregister";
@@ -216,6 +219,7 @@ pub mod methods {
     pub const ADMIN_REGISTER: &str = "admin/register";
     pub const ADMIN_SUBSCRIBE: &str = "admin/subscribe";
     pub const ADMIN_UNSUBSCRIBE: &str = "admin/unsubscribe";
+    pub const ADMIN_DISCONNECT: &str = "admin/disconnect";
     pub const CHANNEL_RENAME: &str = "channel/rename";
     pub const CHANNEL_ARCHIVE: &str = "channel/archive";
     pub const CHANNEL_UNARCHIVE: &str = "channel/unarchive";
@@ -294,6 +298,11 @@ pub enum SystemEvent {
     },
     Disconnected {
         principal: String,
+    },
+    /// The manager dropped a session and freed its principal name.
+    ForceDisconnected {
+        principal: String,
+        by: String,
     },
     Subscribed {
         principal: String,
@@ -531,6 +540,27 @@ pub struct WhoResult {
 pub struct AdminSubscriptionParams {
     pub principal: String,
     pub channel: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DisconnectParams {
+    pub principal: String,
+}
+
+/// `session/evicted` payload. A client that carries its binding across
+/// reconnects must drop it on receipt: the manager freed the name, and
+/// silently re-claiming it on the next connection defeats the verb.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EvictedParams {
+    pub principal: String,
+    pub by: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DisconnectResult {
+    pub principal: String,
+    /// Sessions dropped; zero when the name was already unclaimed.
+    pub sessions: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

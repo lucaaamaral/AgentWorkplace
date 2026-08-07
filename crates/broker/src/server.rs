@@ -11,6 +11,10 @@ use crate::core::Broker;
 /// bounding a single inbound line.
 const LINE_OVERHEAD: usize = 64 * 1024;
 
+/// How long a force-disconnected connection may stay open to flush its
+/// eviction notice before the socket is closed unconditionally.
+const EVICTION_FLUSH: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// Bind every configured address and serve until shutdown is signalled.
 pub async fn run(broker: Broker) -> anyhow::Result<()> {
     let mut listeners = Vec::new();
@@ -133,7 +137,7 @@ async fn handle_connection(broker: Broker, stream: TcpStream) {
     // pointless. It decrements the session's outbound counter per message
     // written (the slow-reader bound lives in Session::send).
     let queued = session.queued.clone();
-    let writer = tokio::spawn(async move {
+    let mut writer = tokio::spawn(async move {
         while let Some(msg) = out_rx.recv().await {
             queued.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
             let mut line = msg.to_line();
@@ -147,17 +151,18 @@ async fn handle_connection(broker: Broker, stream: TcpStream) {
     let max_line = broker.0.cfg.message_size_limit + LINE_OVERHEAD;
     let mut reader = BufReader::new(read_half);
     loop {
-        if session.overflowed() {
-            // The peer stopped reading while the broker kept producing:
-            // tear the session down instead of queuing without bound.
+        if session.overflowed() || session.evicted() {
+            // The peer stopped reading while the broker kept producing, or
+            // the manager dropped this session: tear it down instead of
+            // queuing without bound / holding a released name's connection.
             break;
         }
-        // Select the overflow signal against the read: an idle peer that
-        // never sends another byte must still be torn down when its
-        // outbound queue overflows.
+        // Select the teardown signal against the read: an idle peer that
+        // never sends another byte must still be torn down when its outbound
+        // queue overflows or the manager force-disconnects it.
         let inbound = tokio::select! {
             r = read_line_bounded(&mut reader, max_line) => r,
-            _ = session.overflow_notify.notified() => break,
+            _ = session.close_notify.notified() => break,
         };
         let line = match inbound {
             Ok(InboundLine::Line(line)) => line,
@@ -249,5 +254,21 @@ async fn handle_connection(broker: Broker, stream: TcpStream) {
         // Close the socket now — nothing queued is deliverable to a peer
         // that stopped reading.
         writer.abort();
+        return;
+    }
+    if session.evicted() {
+        // The eviction notice must reach the peer, or it reconnects and
+        // re-claims the name the manager just freed. Dropping this session
+        // reference closes the outbound channel (unless a delivery task
+        // still holds one), so the writer drains and exits on its own.
+        drop(session);
+        if tokio::time::timeout(EVICTION_FLUSH, &mut writer)
+            .await
+            .is_err()
+        {
+            // A straggling delivery task is holding the channel open: the
+            // connection must not outlive the eviction regardless.
+            writer.abort();
+        }
     }
 }

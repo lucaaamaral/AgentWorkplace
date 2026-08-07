@@ -13,7 +13,8 @@ Every future adapter must ship its own session-lifecycle document answering the 
 
 - A session connects anonymous; `register` binds it to a principal ([tool contract](../architecture/message-model.md#tool-contract)).
 - `deregister` is the explicit, logged unbind; connection termination is the implicit one. Either releases the principal name for re-registration.
-- Registration, denial, deregistration, and disconnection are `system` events in the log.
+- Neither is guaranteed to happen. A session whose harness stops participating without closing its bus connection still holds its name, and the broker cannot distinguish that from an idle one — the manager resolves it with `admin/disconnect` ([RPC surface](../architecture/rpc-surface.md#admin-surface)): the principal is unbound, the peer is sent `session/evicted`, and the connection is closed. **An evicted client must drop the binding it carries across reconnects** — otherwise the reconnect below re-claims the name the manager just freed and the eviction achieves nothing — and should tell its session, which is now unregistered. Registering again is the session's own explicit act.
+- Registration, denial, deregistration, disconnection, and force-disconnection are `system` events in the log.
 
 ## Relation to the message lifecycle
 
@@ -21,7 +22,7 @@ Presence determines the fate of a delivery but never advances it: a disconnected
 
 ## Broker restart
 
-Sessions outlive the broker. Every bus-facing client (channel shims, adapters, the TUI) reconnects with capped exponential backoff (on the order of 1 s doubling to ~30 s, indefinitely — the session may outlive a long outage), replays `session/hello`, and re-registers the principal binding it carries; the restarted broker holds no active claims, so re-registration cannot be denied. During the outage nothing buffers client-side: agent tool calls fail with an explicit error per the message model, and shims queue nothing.
+Sessions outlive the broker. Every bus-facing client (channel shims, adapters, the TUI) reconnects with capped exponential backoff (on the order of 1 s doubling to ~30 s, indefinitely — the session may outlive a long outage), replays `session/hello`, and re-registers the principal binding it carries — unless that binding was evicted, in which case there is nothing to replay; the restarted broker holds no active claims, so re-registration cannot be denied. During the outage nothing buffers client-side: agent tool calls fail with an explicit error per the message model, and shims queue nothing.
 
 On the broker side, `held` delivery state survives restart ([ADR-0017](../decision-records/0017-embedded-sqlite-storage.md)) but is re-evaluated, not blindly re-sent: startup opens a re-attach grace window (~60 s) before presence is judged. Held messages whose recipients re-attach within it are delivered; recipients still absent when it closes fail per-recipient (reason: disconnected) — consistent with no store-and-forward across sessions.
 

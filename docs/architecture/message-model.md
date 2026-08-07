@@ -87,7 +87,7 @@ One log. Every record carries a `kind` (`message` | `system`). Registrations, de
 
 - **Message ids**: broker-assigned monotonic integers — unique and order-preserving within one broker. Multi-broker uniqueness (ULIDs etc.) is not a current need.
 - **Channels**: keyed by immutable internal id; display name `#`-prefixed, lowercase alphanumeric plus `-`, broker-enforced. Renames change the display name without rewriting history.
-- **Principals**: same charset discipline, `@`-prefixed in display; uniqueness enforced at registration (active-claim denial, settled).
+- **Principals**: same charset discipline, `@`-prefixed in display; uniqueness enforced at registration (active-claim denial, settled). A claim lasts as long as the session holding it, and the manager can end one whose session has stopped participating (`admin/disconnect` — [RPC surface](rpc-surface.md#admin-surface)).
 
 ## Wire protocol
 

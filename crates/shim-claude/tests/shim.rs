@@ -85,6 +85,21 @@ impl Harness {
         }
     }
 
+    async fn broker_notify(&mut self, method: &str, params: Value) {
+        let notif = json!({ "jsonrpc": "2.0", "method": method, "params": params });
+        self.broker_out
+            .write_all(format!("{notif}\n").as_bytes())
+            .await
+            .unwrap();
+    }
+
+    /// Assert the shim sends the broker nothing during `window`.
+    async fn assert_broker_silent(&mut self, window: std::time::Duration) {
+        if let Ok(line) = tokio::time::timeout(window, self.broker_in.next_line()).await {
+            panic!("unexpected broker traffic: {line:?}");
+        }
+    }
+
     async fn broker_respond(&mut self, req: &Value, result: Value) {
         let resp = json!({ "jsonrpc": "2.0", "id": req["id"], "result": result });
         self.broker_out
@@ -284,6 +299,37 @@ async fn reconnect_replays_the_full_binding() {
     );
     h.broker_respond(&replay, json!({ "principal": "@cx" }))
         .await;
+}
+
+/// A manager force-disconnect is terminal for the binding. The shim still
+/// reconnects — the session is alive and may register again — but replaying
+/// the name would take back what the manager just freed, so the binding is
+/// dropped and the session is told.
+#[tokio::test]
+async fn eviction_drops_the_binding_instead_of_reclaiming_the_name() {
+    let mut h = Harness::start(None).await;
+    h.register(json!({ "name": "@x" })).await;
+
+    h.broker_notify(
+        "session/evicted",
+        json!({ "principal": "@x", "by": "@manager" }),
+    )
+    .await;
+    let notice = h.mcp_next_notification().await;
+    assert_eq!(notice["method"], "notifications/claude/channel");
+    let content = notice["params"]["content"].as_str().unwrap();
+    assert!(
+        content.contains("@manager") && content.contains("@x"),
+        "the session must be told who released its name: {content}"
+    );
+
+    h.sever_and_reaccept().await;
+    h.assert_broker_silent(std::time::Duration::from_millis(300))
+        .await;
+
+    // The tool surface still works: re-registering is the session's own act.
+    let (params, _text) = h.register(json!({ "name": "@x" })).await;
+    assert_eq!(params["name"], "@x");
 }
 
 /// C2 — the no-push-path state survives reconnects: a coordinate-less codex
