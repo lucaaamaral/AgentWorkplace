@@ -17,3 +17,6 @@ tokio-tungstenite.workspace = true
 futures-util.workspace = true
 
 [dev-dependencies]
+# test-util enables Tokio's paused clock (time::pause / advance) for the
+# resume-timeout regression; dev-only, never in the shipped adapter.
+tokio = { workspace = true, features = ["test-util"] }
